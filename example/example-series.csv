@@ -1,0 +1,9 @@
+name,role,team,qr_url
+Ada Lovelace,Engineer,Research,https://example.com/badge/001
+Grace Hopper,Admiral,Compiler Team,https://example.com/badge/002
+Alan Turing,Mathematician,Cryptography,https://example.com/badge/003
+Katherine Johnson,Scientist,Flight Research,https://example.com/badge/004
+Margaret Hamilton,Software Engineer,Apollo,https://example.com/badge/005
+Edsger Dijkstra,Computer Scientist,Algorithms,https://example.com/badge/006
+Barbara Liskov,Professor,Programming Languages,https://example.com/badge/007
+Donald Knuth,Author,Computer Science,https://example.com/badge/008
