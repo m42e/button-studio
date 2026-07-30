@@ -18,9 +18,40 @@ quieter desktop layout and a print-oriented export path.
 - Bounded undo and redo history
 - Trim-accurate preview plus a single labeled finished-edge guide on the canvas
 - PNG, JPEG, and WebP image import
-- Human-readable `.buttonstudio` project save/load
+- Self-contained, human-readable `.buttonstudio` project save/load
+- Embedded project artwork previews for macOS Finder and Quick Look
 - Transparent PNG export sized at 300 DPI
 - CSV series printing with personalized text and QR variables
+- MCP server for programmatic design editing, export, and visual snapshots
+
+## MCP server
+
+The main `button-studio` executable exposes the designer over the Model Context
+Protocol using stdio. A normal launch starts the GUI and MCP together; MCP edits
+are synchronized to the visible canvas, and GUI edits are available to MCP
+tools. Run MCP without a window with:
+
+```sh
+cargo run -- --headless
+```
+
+The included [`.vscode/mcp.json`](.vscode/mcp.json) registers this headless mode
+as `button-studio` in VS Code. Start or debug it from VS Code's MCP server
+controls. A headless session starts with a blank 59 mm button. The server
+provides tools to:
+
+- create, open, inspect, and save designs
+- add text, shape, QR code, and embedded image objects
+- use an imported image as a cover-cropped background
+- update object position, rotation, color, opacity, visibility, content, and size
+- duplicate, delete, and reorder objects
+- change button and background settings
+- export PNG, printable PDF sheets, and `.buttonstudio` projects
+- return an inline PNG snapshot for visual inspection
+
+Paths may be absolute or relative to the MCP server process. Position values
+are normalized relative to the artwork radius: `[0, 0]` is centered and each
+axis ranges from `-1` to `1`. Colors use `#RRGGBB` or `#RRGGBBAA`.
 
 ## Series printing
 
@@ -68,10 +99,27 @@ cargo fmt --all --check
 
 ## Files
 
-Project files store design data as versioned JSON. Imported artwork and selected
-system fonts remain linked to their original file paths, so keep those resources
-available when moving a project between machines. A missing font is reported
-when opening the project instead of silently changing the design.
+Project files store design data as versioned JSON. Imported PNG, JPEG, and WebP
+artwork is embedded in an asset table as base64 while preserving its original
+encoded format. Image layers and photo backgrounds reference assets by the
+SHA-256 digest of their bytes, so identical artwork imported repeatedly or used
+in both roles is stored only once. Saving removes assets that are no longer used.
+Base64 keeps projects easy to inspect but increases the encoded image payload by
+roughly one third compared with the original binary data.
+
+Each newly saved project also contains a derived 512 x 512 PNG under its
+top-level `preview` key. The preview is not editable design state and is ignored
+when loading, so projects remain backward compatible and other platforms can
+continue treating them as JSON. Older projects gain a preview the next time they
+are saved.
+
+Version 7 and older path-based projects remain supported. Button Studio reads
+each linked image when opening a legacy project, migrates it to the embedded
+asset table in memory, and writes the self-contained format on the next save.
+Missing legacy images are reported with their path. New-format projects never
+need the original image files for previewing, reopening, or export. Selected
+system fonts remain linked to their original paths; a missing font is reported
+instead of silently changing the design.
 
 Exports are transparent PNG files. For example, a 59 mm button exports at
 697 x 697 pixels, corresponding to 300 DPI. The artwork canvas includes 5 mm
@@ -80,3 +128,25 @@ selected physical button diameter.
 
 Archivo Black is bundled under the SIL Open Font License; see
 [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt).
+
+## macOS app bundle
+
+Finder thumbnails and Space-bar Quick Look require the app's thumbnail and
+preview extensions in addition to the embedded PNG. Build the app bundle with:
+
+```sh
+scripts/build-macos-app.sh
+```
+
+The result is `target/macos/Pincraft Button Studio.app`. The script uses ad-hoc
+signing by default for build verification. For an installable or distributable
+build, pass one signing identity for the host and both extensions:
+
+```sh
+CODE_SIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
+	scripts/build-macos-app.sh
+```
+
+Install the normally signed app in `/Applications` and open it once so Launch
+Services registers the `.buttonstudio` document type and its Quick Look
+providers.

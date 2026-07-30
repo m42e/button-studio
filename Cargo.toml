@@ -2,9 +2,15 @@
 name = "button-studio"
 version = "0.1.0"
 edition = "2024"
+autobins = false
+
+[[bin]]
+name = "button-studio"
+path = "src/main.rs"
 
 [dependencies]
-ab_glyph = "0.2.32"
+base64 = "0.22.1"
+cosmic-text = "0.19.0"
 csv = "1.4.0"
 eframe = "0.35.0"
 fontdb = "0.23.0"
@@ -14,5 +20,8 @@ imageproc = "0.27.0"
 printpdf = { version = "0.8.2", default-features = false }
 qrcode = "0.14.1"
 rfd = "0.17.2"
+rmcp = { version = "3.0.1", features = ["server", "transport-io"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

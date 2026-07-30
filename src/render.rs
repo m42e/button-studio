@@ -1,17 +1,14 @@
 use crate::model::{
     BackgroundStyle, Design, DesignColor, Element, ElementKind, ShapeKind, TextFont,
 };
-use ab_glyph::FontVec;
 use eframe::egui::{
-    self, Align2, Color32, FontFamily, FontId, Pos2, Rect, Shape, Stroke, StrokeKind,
+    self, Align2, Color32, ColorImage, FontId, Pos2, Rect, Shape, Stroke, StrokeKind,
     TextureHandle, TextureOptions, Vec2, pos2, vec2,
 };
-use eframe::epaint::{Mesh, TextShape, Vertex};
+use eframe::epaint::{Mesh, Vertex};
 use image::{Rgba, RgbaImage, imageops};
 use imageproc::{
-    drawing::{
-        draw_filled_circle_mut, draw_line_segment_mut, draw_polygon_mut, draw_text_mut, text_size,
-    },
+    drawing::{draw_filled_circle_mut, draw_line_segment_mut, draw_polygon_mut},
     geometric_transformations::{Border, Interpolation, rotate_about_center_no_crop},
     point::Point,
 };
@@ -20,7 +17,7 @@ use printpdf::{
     XObjectTransform,
 };
 use qrcode::{Color, QrCode};
-use std::{collections::HashMap, fs, path::Path, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, fs, io::Cursor, path::Path};
 
 const EXPORT_DPI: f32 = 300.0;
 const EXPORT_SUPERSAMPLE: u32 = 2;
@@ -28,9 +25,8 @@ const A4_WIDTH_MM: f32 = 210.0;
 const A4_HEIGHT_MM: f32 = 297.0;
 const PDF_MARGIN_MM: f32 = 5.0;
 const PDF_BUTTON_GAP_MM: f32 = 2.0;
-const DISPLAY_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/ArchivoBlack-Regular.ttf");
 
-pub type TextureMap = HashMap<u64, TextureHandle>;
+pub type TextureMap = HashMap<String, TextureHandle>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PdfExportSummary {
@@ -40,15 +36,15 @@ pub struct PdfExportSummary {
 
 pub fn load_texture(
     context: &egui::Context,
-    id: u64,
-    path: &Path,
+    asset_id: &str,
+    data: &[u8],
 ) -> Result<TextureHandle, String> {
-    let decoded = image::open(path)
-        .map_err(|error| format!("Could not open image: {error}"))?
+    let decoded = image::load_from_memory(data)
+        .map_err(|error| format!("Could not decode embedded image {asset_id}: {error}"))?
         .to_rgba8();
     let size = [decoded.width() as usize, decoded.height() as usize];
     let image = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
-    Ok(context.load_texture(format!("artwork-{id}"), image, TextureOptions::LINEAR))
+    Ok(context.load_texture(format!("artwork-{asset_id}"), image, TextureOptions::LINEAR))
 }
 
 pub fn paint_design(
@@ -78,16 +74,27 @@ pub fn paint_design(
             Stroke::new(1.0, Color32::from_black_alpha(120)),
             StrokeKind::Outside,
         );
-        for handle in [
-            bounds.left_top(),
-            bounds.right_top(),
-            bounds.left_bottom(),
-            bounds.right_bottom(),
-        ] {
+        for handle in selection_handles(bounds, painter.clip_rect()) {
             painter.circle_filled(handle, 4.5, Color32::WHITE);
             painter.circle_stroke(handle, 4.5, Stroke::new(1.0, Color32::from_gray(55)));
         }
     }
+}
+
+pub fn selection_handles(bounds: Rect, canvas_rect: Rect) -> [Pos2; 4] {
+    let handle_rect = canvas_rect.shrink(8.0);
+    [
+        bounds.left_top(),
+        bounds.right_top(),
+        bounds.left_bottom(),
+        bounds.right_bottom(),
+    ]
+    .map(|handle| {
+        Pos2::new(
+            handle.x.clamp(handle_rect.left(), handle_rect.right()),
+            handle.y.clamp(handle_rect.top(), handle_rect.bottom()),
+        )
+    })
 }
 
 pub fn paint_preview(painter: &egui::Painter, rect: Rect, design: &Design, textures: &TextureMap) {
@@ -281,7 +288,7 @@ pub fn element_bounds(
 }
 
 fn unrotated_element_bounds(
-    painter: &egui::Painter,
+    _painter: &egui::Painter,
     center: Pos2,
     radius: f32,
     element: &Element,
@@ -294,27 +301,19 @@ fn unrotated_element_bounds(
             font,
             curvature,
         } => {
-            if curvature.abs() > f32::EPSILON {
-                return curved_text_bounds(
-                    painter,
-                    element_center,
-                    radius,
-                    text,
-                    *font_size,
-                    font,
-                    *curvature,
-                );
-            }
-            let galley = painter.layout_no_wrap(
-                text.clone(),
-                text_font_id(radius, *font_size, font),
-                Color32::WHITE,
-            );
-            let layout_rect = Align2::CENTER_CENTER.anchor_size(element_center, galley.size());
-            if galley.mesh_bounds.width() > 0.0 && galley.mesh_bounds.height() > 0.0 {
-                galley.mesh_bounds.translate(layout_rect.min.to_vec2())
+            let scale = radius * 2.0 * *font_size;
+            let color = Rgba([255, 255, 255, 255]);
+            let composed = if curvature.abs() <= f32::EPSILON {
+                compose_straight_text(text, scale, font, color)
             } else {
-                layout_rect
+                compose_curved_text(text, scale, font, *curvature, color)
+            };
+            match composed {
+                Some((image, origin)) => Rect::from_min_size(
+                    element_center - origin,
+                    vec2(image.width() as f32, image.height() as f32),
+                ),
+                None => Rect::from_center_size(element_center, Vec2::ZERO),
             }
         }
         ElementKind::Shape { shape, size } => Rect::from_center_size(
@@ -366,6 +365,15 @@ pub fn export_png(design: &Design, path: &Path) -> Result<u32, String> {
         .save(path)
         .map_err(|error| format!("Could not save PNG: {error}"))?;
     Ok(output_size)
+}
+
+pub fn render_project_preview_png(design: &Design, output_size: u32) -> Result<Vec<u8>, String> {
+    let output = render_trimmed_badge(design, output_size, 1)?;
+    let mut bytes = Cursor::new(Vec::new());
+    output
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .map_err(|error| format!("Could not encode project preview: {error}"))?;
+    Ok(bytes.into_inner())
 }
 
 pub fn export_pdf_sheet(design: &Design, path: &Path) -> Result<usize, String> {
@@ -506,10 +514,24 @@ fn render_trimmed_badge(
     let center = render_size as f32 / 2.0;
     let artwork_radius = center;
     let mut canvas = RgbaImage::from_pixel(render_size, render_size, Rgba([0, 0, 0, 0]));
+    let mut decoded_assets = HashMap::new();
 
-    raster_background(&mut canvas, center, artwork_radius, design)?;
+    raster_background(
+        &mut canvas,
+        center,
+        artwork_radius,
+        design,
+        &mut decoded_assets,
+    )?;
     for element in design.elements.iter().filter(|element| element.visible) {
-        raster_element(&mut canvas, center, artwork_radius, element)?;
+        raster_element(
+            &mut canvas,
+            center,
+            artwork_radius,
+            element,
+            design,
+            &mut decoded_assets,
+        )?;
     }
 
     let radius_squared = artwork_radius * artwork_radius;
@@ -548,7 +570,7 @@ fn paint_background(
     painter.circle_filled(center, radius, base);
 
     if let Some(background_image) = &design.background_image
-        && let Some(texture) = textures.get(&background_image.id)
+        && let Some(texture) = textures.get(&background_image.asset_id)
     {
         paint_textured_circle(
             painter,
@@ -667,7 +689,6 @@ fn paint_element(
     textures: &TextureMap,
 ) {
     let position = center + vec2(element.position[0], element.position[1]) * radius;
-    let rotation = element.rotation.to_radians();
     let color = element_color(element);
     match &element.kind {
         ElementKind::Text {
@@ -676,19 +697,26 @@ fn paint_element(
             font,
             curvature,
         } => {
-            if curvature.abs() <= f32::EPSILON {
-                let galley = painter.layout_no_wrap(
-                    text.clone(),
-                    text_font_id(radius, *font_size, font),
-                    color,
-                );
-                painter.add(
-                    TextShape::new(position - galley.size() / 2.0, galley, color)
-                        .with_angle_and_anchor(rotation, Align2::CENTER_CENTER),
-                );
-            } else {
-                paint_curved_text(
-                    painter, position, radius, text, *font_size, font, *curvature, rotation, color,
+            let ppp = painter.ctx().pixels_per_point();
+            let scale = radius * 2.0 * *font_size * ppp;
+            let raster_color = element_rgba(element);
+            if let Some((texture_id, size, origin)) = text_texture(
+                painter.ctx(),
+                text,
+                scale,
+                font,
+                *curvature,
+                raster_color,
+                ppp,
+            ) {
+                let rect = Rect::from_min_size(position - origin, size);
+                paint_rotated_image(
+                    painter,
+                    texture_id,
+                    rect,
+                    position,
+                    element.rotation,
+                    Color32::WHITE,
                 );
             }
         }
@@ -707,9 +735,9 @@ fn paint_element(
                 painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
             }
         },
-        ElementKind::Image { .. } => {
+        ElementKind::Image { asset_id, .. } => {
             let bounds = unrotated_element_bounds(painter, center, radius, element);
-            if let Some(texture) = textures.get(&element.id) {
+            if let Some(texture) = textures.get(asset_id) {
                 paint_rotated_image(
                     painter,
                     texture.id(),
@@ -838,11 +866,147 @@ fn paint_qr_code(
     }
 }
 
-fn text_font_id(radius: f32, font_size: f32, font: &TextFont) -> FontId {
-    FontId::new(
-        radius * 2.0 * font_size,
-        FontFamily::Name(Arc::from(font.registration_key())),
-    )
+struct TextTexture {
+    handle: TextureHandle,
+    size: Vec2,
+    origin: Vec2,
+}
+
+thread_local! {
+    static TEXT_TEXTURES: RefCell<HashMap<u64, TextTexture>> = RefCell::new(HashMap::new());
+}
+
+fn element_rgba(element: &Element) -> Rgba<u8> {
+    let mut color = element.color;
+    color.alpha = ((color.alpha as u16 * element.opacity as u16) / 255) as u8;
+    rgba(color)
+}
+
+/// Rasterizes straight text into a tight RGBA image through the shared export
+/// pipeline. The returned origin is the pixel offset that maps to the element
+/// position (the image center).
+fn compose_straight_text(
+    text: &str,
+    scale: f32,
+    font: &TextFont,
+    color: Rgba<u8>,
+) -> Option<(RgbaImage, Vec2)> {
+    let image = crate::text_raster::render_line(text, scale, font, color)?;
+    let origin = vec2(image.width() as f32 / 2.0, image.height() as f32 / 2.0);
+    Some((image, origin))
+}
+
+/// Rasterizes curved text into an RGBA image through the shared export pipeline.
+/// The returned origin is the pixel offset that maps to the element position
+/// (the arc center).
+fn compose_curved_text(
+    text: &str,
+    scale: f32,
+    font: &TextFont,
+    curvature: f32,
+    color: Rgba<u8>,
+) -> Option<(RgbaImage, Vec2)> {
+    let tiles = crate::text_raster::render_glyph_tiles(text, scale, font, color);
+    let widths = tiles.iter().map(|(_, advance)| *advance).collect::<Vec<_>>();
+
+    let mut placed = Vec::new();
+    let mut min = vec2(f32::INFINITY, f32::INFINITY);
+    let mut max = vec2(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for ((tile, _), placement) in tiles.iter().zip(arc_glyphs(&widths, curvature)) {
+        let Some(tile) = tile else {
+            continue;
+        };
+        let rotated = rotate_about_center_no_crop(
+            tile,
+            placement.angle,
+            Interpolation::Bicubic,
+            Border::Constant(Rgba([0, 0, 0, 0])),
+        );
+        let width = rotated.width() as f32;
+        let height = rotated.height() as f32;
+        let left = placement.offset.x - width / 2.0;
+        let top = placement.offset.y - height / 2.0;
+        min.x = min.x.min(left);
+        min.y = min.y.min(top);
+        max.x = max.x.max(left + width);
+        max.y = max.y.max(top + height);
+        placed.push((rotated, left, top));
+    }
+    if placed.is_empty() {
+        return None;
+    }
+
+    let width = (max.x - min.x).ceil().max(1.0) as u32;
+    let height = (max.y - min.y).ceil().max(1.0) as u32;
+    let mut canvas = RgbaImage::new(width, height);
+    for (image, left, top) in &placed {
+        imageops::overlay(
+            &mut canvas,
+            image,
+            (left - min.x).round() as i64,
+            (top - min.y).round() as i64,
+        );
+    }
+    Some((canvas, vec2(-min.x, -min.y)))
+}
+
+/// Rasterizes a text element through the shared export pipeline and caches the
+/// result as an egui texture so the editor preview matches the exported artwork
+/// pixel-for-pixel (including where glyphs fall relative to the trim edge).
+/// Returns the texture id, its logical size, and the logical origin that maps to
+/// the element position.
+fn text_texture(
+    ctx: &egui::Context,
+    text: &str,
+    scale: f32,
+    font: &TextFont,
+    curvature: f32,
+    color: Rgba<u8>,
+    pixels_per_point: f32,
+) -> Option<(egui::TextureId, Vec2, Vec2)> {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    font.registration_key().hash(&mut hasher);
+    scale.to_bits().hash(&mut hasher);
+    curvature.to_bits().hash(&mut hasher);
+    color.0.hash(&mut hasher);
+    let key = hasher.finish();
+
+    TEXT_TEXTURES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&key) {
+            let (image, origin) = if curvature.abs() <= f32::EPSILON {
+                compose_straight_text(text, scale, font, color)
+            } else {
+                compose_curved_text(text, scale, font, curvature, color)
+            }?;
+            let dimensions = [image.width() as usize, image.height() as usize];
+            let color_image = ColorImage::from_rgba_unmultiplied(dimensions, image.as_raw());
+            let handle = ctx.load_texture(
+                format!("text-{key:016x}"),
+                color_image,
+                TextureOptions::LINEAR,
+            );
+            if cache.len() > 512 {
+                cache.clear();
+            }
+            cache.insert(
+                key,
+                TextTexture {
+                    handle,
+                    size: vec2(
+                        dimensions[0] as f32 / pixels_per_point,
+                        dimensions[1] as f32 / pixels_per_point,
+                    ),
+                    origin: origin / pixels_per_point,
+                },
+            );
+        }
+        let entry = cache.get(&key)?;
+        Some((entry.handle.id(), entry.size, entry.origin))
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -885,86 +1049,6 @@ fn arc_glyphs(widths: &[f32], curvature: f32) -> Vec<ArcGlyph> {
             })
         })
         .collect()
-}
-
-fn curved_text_shapes(
-    painter: &egui::Painter,
-    position: Pos2,
-    radius: f32,
-    text: &str,
-    font_size: f32,
-    font: &TextFont,
-    curvature: f32,
-    rotation: f32,
-    color: Color32,
-) -> Vec<TextShape> {
-    let font_id = text_font_id(radius, font_size, font);
-    let glyphs = text
-        .chars()
-        .map(|character| painter.layout_no_wrap(character.to_string(), font_id.clone(), color))
-        .collect::<Vec<_>>();
-    let widths = glyphs
-        .iter()
-        .map(|galley| galley.size().x)
-        .collect::<Vec<_>>();
-
-    glyphs
-        .into_iter()
-        .zip(arc_glyphs(&widths, curvature))
-        .map(|(galley, placement)| {
-            let top_left =
-                position + rotate_vector(placement.offset, rotation) - galley.size() / 2.0;
-            TextShape::new(top_left, galley, color)
-                .with_angle_and_anchor(placement.angle + rotation, Align2::CENTER_CENTER)
-        })
-        .collect()
-}
-
-fn paint_curved_text(
-    painter: &egui::Painter,
-    position: Pos2,
-    radius: f32,
-    text: &str,
-    font_size: f32,
-    font: &TextFont,
-    curvature: f32,
-    rotation: f32,
-    color: Color32,
-) {
-    for shape in curved_text_shapes(
-        painter, position, radius, text, font_size, font, curvature, rotation, color,
-    ) {
-        painter.add(shape);
-    }
-}
-
-fn curved_text_bounds(
-    painter: &egui::Painter,
-    position: Pos2,
-    radius: f32,
-    text: &str,
-    font_size: f32,
-    font: &TextFont,
-    curvature: f32,
-) -> Rect {
-    curved_text_shapes(
-        painter,
-        position,
-        radius,
-        text,
-        font_size,
-        font,
-        curvature,
-        0.0,
-        Color32::WHITE,
-    )
-    .into_iter()
-    .filter(|shape| {
-        shape.galley.mesh_bounds.width() > 0.0 && shape.galley.mesh_bounds.height() > 0.0
-    })
-    .map(|shape| shape.visual_bounding_rect())
-    .reduce(|bounds, glyph| bounds.union(glyph))
-    .unwrap_or_else(|| Rect::from_center_size(position, Vec2::ZERO))
 }
 
 fn paint_polygon_fan(painter: &egui::Painter, center: Pos2, points: &[Pos2], color: Color32) {
@@ -1065,6 +1149,7 @@ fn raster_background(
     center: f32,
     radius: f32,
     design: &Design,
+    decoded_assets: &mut HashMap<String, RgbaImage>,
 ) -> Result<(), String> {
     if design.background_style == BackgroundStyle::None {
         return Ok(());
@@ -1074,16 +1159,9 @@ fn raster_background(
     draw_filled_circle_mut(canvas, (center as i32, center as i32), radius as i32, base);
 
     if let Some(background_image) = &design.background_image {
-        let source = image::open(&background_image.path)
-            .map_err(|error| {
-                format!(
-                    "Could not open backdrop {}: {error}",
-                    background_image.path.display()
-                )
-            })?
-            .to_rgba8();
+        let source = decoded_asset(design, decoded_assets, &background_image.asset_id)?;
         let target_size = (radius * 2.0).round().max(1.0) as u32;
-        let covered = cover_square(&source, target_size);
+        let covered = cover_square(source, target_size);
         imageops::overlay(
             canvas,
             &covered,
@@ -1188,16 +1266,25 @@ fn raster_element(
     center: f32,
     radius: f32,
     element: &Element,
+    design: &Design,
+    decoded_assets: &mut HashMap<String, RgbaImage>,
 ) -> Result<(), String> {
     if element.rotation.abs() <= f32::EPSILON {
-        return raster_element_unrotated(canvas, center, radius, element);
+        return raster_element_unrotated(canvas, center, radius, element, design, decoded_assets);
     }
 
     let mut layer = RgbaImage::from_pixel(canvas.width(), canvas.height(), Rgba([0, 0, 0, 0]));
     let mut local_element = element.clone();
     local_element.position = [0.0, 0.0];
     local_element.rotation = 0.0;
-    raster_element_unrotated(&mut layer, center, radius, &local_element)?;
+    raster_element_unrotated(
+        &mut layer,
+        center,
+        radius,
+        &local_element,
+        design,
+        decoded_assets,
+    )?;
     let rotated = rotate_about_center_no_crop(
         &layer,
         element.rotation.to_radians(),
@@ -1218,6 +1305,8 @@ fn raster_element_unrotated(
     center: f32,
     radius: f32,
     element: &Element,
+    design: &Design,
+    decoded_assets: &mut HashMap<String, RgbaImage>,
 ) -> Result<(), String> {
     let x = center + element.position[0] * radius;
     let y = center + element.position[1] * radius;
@@ -1231,17 +1320,16 @@ fn raster_element_unrotated(
             font,
             curvature,
         } => {
-            let font = load_raster_font(font)?;
             let scale = radius * 2.0 * font_size;
             if curvature.abs() <= f32::EPSILON {
-                raster_centered_text(canvas, pos2(x, y), text, scale, &font, rgba(color));
+                raster_centered_text(canvas, pos2(x, y), text, scale, font, rgba(color));
             } else {
                 raster_curved_text(
                     canvas,
                     pos2(x, y),
                     text,
                     scale,
-                    &font,
+                    font,
                     *curvature,
                     rgba(color),
                 );
@@ -1265,17 +1353,15 @@ fn raster_element_unrotated(
             }
         }
         ElementKind::Image {
-            path,
+            asset_id,
             width,
             aspect_ratio,
         } => {
-            let source = image::open(path)
-                .map_err(|error| format!("Could not open {}: {error}", path.display()))?
-                .to_rgba8();
+            let source = decoded_asset(design, decoded_assets, asset_id)?;
             let target_width = (radius * 2.0 * width).max(1.0) as u32;
             let target_height = (target_width as f32 / aspect_ratio).max(1.0) as u32;
             let mut resized = imageops::resize(
-                &source,
+                source,
                 target_width,
                 target_height,
                 imageops::FilterType::Lanczos3,
@@ -1312,44 +1398,41 @@ fn raster_element_unrotated(
     Ok(())
 }
 
+fn decoded_asset<'a>(
+    design: &Design,
+    decoded_assets: &'a mut HashMap<String, RgbaImage>,
+    asset_id: &str,
+) -> Result<&'a RgbaImage, String> {
+    if !decoded_assets.contains_key(asset_id) {
+        let asset = design.asset(asset_id)?;
+        let decoded = image::load_from_memory(&asset.data)
+            .map_err(|error| format!("Could not decode embedded image {asset_id}: {error}"))?
+            .to_rgba8();
+        decoded_assets.insert(asset_id.to_owned(), decoded);
+    }
+    Ok(&decoded_assets[asset_id])
+}
+
 fn raster_centered_text(
     canvas: &mut RgbaImage,
     position: Pos2,
     text: &str,
     scale: f32,
-    font: &FontVec,
+    font: &TextFont,
     color: Rgba<u8>,
 ) {
-    let (width, height) = text_size(scale, font, text);
-    let padding = scale.ceil().max(2.0) as u32;
-    let mut layer = RgbaImage::from_pixel(
-        width.max(1) + padding * 2,
-        height.max(1) + padding * 2,
-        Rgba([0, 0, 0, 0]),
-    );
-    draw_text_mut(
-        &mut layer,
-        color,
-        padding as i32,
-        padding as i32,
-        scale,
-        font,
-        text,
-    );
-
-    let Some((left, top, right, bottom)) = alpha_bounds(&layer) else {
+    let Some((image, origin)) = compose_straight_text(text, scale, font, color) else {
         return;
     };
-    let glyphs =
-        imageops::crop_imm(&layer, left, top, right - left + 1, bottom - top + 1).to_image();
     imageops::overlay(
         canvas,
-        &glyphs,
-        (position.x - glyphs.width() as f32 / 2.0).round() as i64,
-        (position.y - glyphs.height() as f32 / 2.0).round() as i64,
+        &image,
+        (position.x - origin.x).round() as i64,
+        (position.y - origin.y).round() as i64,
     );
 }
 
+#[cfg(test)]
 fn alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
     let mut bounds: Option<(u32, u32, u32, u32)> = None;
     for (x, y, pixel) in image.enumerate_pixels() {
@@ -1421,66 +1504,19 @@ fn raster_curved_text(
     position: Pos2,
     text: &str,
     scale: f32,
-    font: &FontVec,
+    font: &TextFont,
     curvature: f32,
     color: Rgba<u8>,
 ) {
-    let characters = text.chars().collect::<Vec<_>>();
-    let sizes = characters
-        .iter()
-        .map(|character| text_size(scale, font, &character.to_string()))
-        .collect::<Vec<_>>();
-    let widths = sizes
-        .iter()
-        .map(|(width, _)| *width as f32)
-        .collect::<Vec<_>>();
-
-    for ((character, (width, height)), placement) in characters
-        .into_iter()
-        .zip(sizes)
-        .zip(arc_glyphs(&widths, curvature))
-    {
-        if character.is_whitespace() {
-            continue;
-        }
-        let padding = scale.ceil().max(2.0) as u32;
-        let mut glyph = RgbaImage::from_pixel(
-            width.max(1) + padding * 2,
-            height.max(1) + padding * 2,
-            Rgba([0, 0, 0, 0]),
-        );
-        draw_text_mut(
-            &mut glyph,
-            color,
-            padding as i32,
-            padding as i32,
-            scale,
-            font,
-            &character.to_string(),
-        );
-        let rotated = rotate_about_center_no_crop(
-            &glyph,
-            placement.angle,
-            Interpolation::Bicubic,
-            Border::Constant(Rgba([0, 0, 0, 0])),
-        );
-        imageops::overlay(
-            canvas,
-            &rotated,
-            (position.x + placement.offset.x - rotated.width() as f32 / 2.0).round() as i64,
-            (position.y + placement.offset.y - rotated.height() as f32 / 2.0).round() as i64,
-        );
-    }
-}
-
-fn load_raster_font(font: &TextFont) -> Result<FontVec, String> {
-    let bytes = match &font.path {
-        Some(path) => std::fs::read(path)
-            .map_err(|error| format!("Could not load font {}: {error}", font.family))?,
-        None => DISPLAY_FONT_BYTES.to_vec(),
+    let Some((image, origin)) = compose_curved_text(text, scale, font, curvature, color) else {
+        return;
     };
-    FontVec::try_from_vec_and_index(bytes, font.index)
-        .map_err(|error| format!("Could not parse font {}: {error}", font.family))
+    imageops::overlay(
+        canvas,
+        &image,
+        (position.x - origin.x).round() as i64,
+        (position.y - origin.y).round() as i64,
+    );
 }
 
 fn element_color(element: &Element) -> Color32 {
@@ -1590,6 +1626,17 @@ mod tests {
     }
 
     #[test]
+    fn project_preview_is_a_valid_png_at_the_requested_size() {
+        let bytes = render_project_preview_png(&Design::default(), 512)
+            .expect("render embedded project preview");
+        let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+            .expect("decode embedded project preview");
+
+        assert_eq!(image.width(), 512);
+        assert_eq!(image.height(), 512);
+    }
+
+    #[test]
     fn pdf_sheet_packs_full_size_artwork_inside_page_margins() {
         let design = Design::default();
         let diameter = design.artwork_diameter_mm();
@@ -1655,7 +1702,7 @@ mod tests {
         let mut design = Design::default();
         design.elements.clear();
         design.background_style = BackgroundStyle::None;
-        design.set_background_image(Path::new("missing-backdrop.png").to_owned(), 1.0);
+        design.set_background_image("missing-backdrop".to_owned(), 1.0);
 
         let image = render_trimmed_badge(&design, 64, 1).expect("render transparent badge");
 
@@ -1710,13 +1757,12 @@ mod tests {
     #[test]
     fn raster_text_is_centered_by_visible_glyphs() {
         let mut canvas = RgbaImage::from_pixel(320, 180, Rgba([0, 0, 0, 0]));
-        let font = load_raster_font(&TextFont::default()).expect("load bundled font");
         raster_centered_text(
             &mut canvas,
             pos2(160.0, 90.0),
             "MAKE IT YOURS",
             32.0,
-            &font,
+            &TextFont::default(),
             Rgba([255, 255, 255, 255]),
         );
 
@@ -1827,13 +1873,16 @@ mod tests {
             .expect("save background fixture");
         let mut design = Design::default();
         design.elements.clear();
-        design.set_background_image(background_path.clone(), 2.0);
+        let (asset_id, aspect_ratio) = design
+            .import_asset_path(&background_path)
+            .expect("import background fixture");
+        design.set_background_image(asset_id, aspect_ratio);
+        std::fs::remove_file(&background_path).expect("remove background fixture");
 
         let size = export_png(&design, &export_path).expect("export photo backdrop");
         let image = image::open(&export_path)
             .expect("open photo export")
             .to_rgba8();
-        std::fs::remove_file(background_path).expect("remove background fixture");
         std::fs::remove_file(export_path).expect("remove photo export");
 
         assert_eq!(
@@ -1841,5 +1890,28 @@ mod tests {
             &Rgba([210, 40, 70, 255])
         );
         assert_eq!(image.get_pixel(0, 0)[3], 0);
+    }
+
+    #[test]
+    fn foreground_image_renders_after_original_file_is_deleted() {
+        let image_path = std::env::temp_dir().join(format!(
+            "button-studio-foreground-{}.png",
+            std::process::id()
+        ));
+        RgbaImage::from_pixel(4, 4, Rgba([25, 180, 90, 255]))
+            .save(&image_path)
+            .expect("save foreground fixture");
+        let mut design = Design::default();
+        design.background_style = BackgroundStyle::None;
+        design.elements.clear();
+        let (asset_id, aspect_ratio) = design
+            .import_asset_path(&image_path)
+            .expect("import foreground fixture");
+        design.add_image(asset_id, aspect_ratio);
+        std::fs::remove_file(image_path).expect("remove foreground fixture");
+
+        let rendered = render_trimmed_badge(&design, 64, 1).expect("render embedded foreground");
+
+        assert_eq!(rendered.get_pixel(32, 32), &Rgba([25, 180, 90, 255]));
     }
 }

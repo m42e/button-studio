@@ -1,13 +1,14 @@
 use crate::{
+    document::SharedDocument,
     fonts::{AvailableFont, FontCatalog},
     model::{
         BackgroundStyle, Design, DesignColor, ELEMENT_POSITION_LIMIT, ElementKind, History,
-        ShapeKind, TextFont,
+        IMAGE_WIDTH_LIMIT, ShapeKind, TextFont,
     },
     render::{
         TextureMap, element_bounds, export_pdf_series, export_pdf_sheet, export_pixel_size,
         export_png, hit_test, load_texture, paint_design, paint_preview, paint_trim_boundary,
-        selection_bounds,
+        render_project_preview_png, selection_bounds, selection_handles,
     },
     series::SeriesData,
     theme::{ACCENT, INK, MINT, MUTED, PAPER, SURFACE, display_font, icon, icon_text},
@@ -16,7 +17,6 @@ use eframe::egui::{
     self, Align, Button, Color32, Frame, Key, Layout, RichText, ScrollArea, Sense, Stroke,
     StrokeKind, Ui, Vec2, vec2,
 };
-use image::GenericImageView;
 use std::{fs, path::PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -98,6 +98,8 @@ impl Tool {
 
 pub struct ButtonStudio {
     design: Design,
+    shared_document: Option<SharedDocument>,
+    shared_revision: u64,
     history: History,
     selected: Option<u64>,
     alignment_reference: Option<u64>,
@@ -128,6 +130,8 @@ impl ButtonStudio {
         let font_count = font_catalog.available.len();
         Self {
             design: Design::default(),
+            shared_document: None,
+            shared_revision: 0,
             history: History::default(),
             selected: Some(2),
             alignment_reference: None,
@@ -149,6 +153,51 @@ impl ButtonStudio {
             pending_font_change: None,
             pending_project: None,
             series: None,
+        }
+    }
+
+    pub fn with_document(
+        context: &eframe::CreationContext<'_>,
+        shared_document: SharedDocument,
+    ) -> Self {
+        let mut app = Self::new(context);
+        if let Ok((design, revision)) = shared_document.snapshot() {
+            app.design = design;
+            app.shared_revision = revision;
+            app.reload_textures(&context.egui_ctx);
+        }
+        app.shared_document = Some(shared_document);
+        app
+    }
+
+    fn pull_shared_document(&mut self, context: &egui::Context) {
+        let Some(shared_document) = &self.shared_document else {
+            return;
+        };
+        let Ok((design, revision)) = shared_document.snapshot() else {
+            return;
+        };
+        if revision == self.shared_revision {
+            return;
+        }
+        self.history.record(self.design.clone());
+        self.design = design;
+        self.shared_revision = revision;
+        self.selected = self
+            .selected
+            .filter(|id| self.design.element(*id).is_some())
+            .or_else(|| self.design.elements.last().map(|element| element.id));
+        self.reload_textures(context);
+        self.set_status("Design updated through MCP", false);
+    }
+
+    fn publish_shared_document(&mut self, context: &egui::Context) {
+        let Some(shared_document) = &self.shared_document else {
+            return;
+        };
+        match shared_document.replace_if_revision(self.shared_revision, &self.design) {
+            Ok(revision) => self.shared_revision = revision,
+            Err(_) => context.request_repaint(),
         }
     }
 
@@ -499,16 +548,18 @@ impl ButtonStudio {
                         let resize = self.selected.and_then(|id| {
                             let element = self.design.element(id)?;
                             let bounds = selection_bounds(&painter, center, radius, element);
-                            resize_handle_at(pointer, bounds).map(|_| CanvasInteraction::Resize {
-                                id,
-                                start_distance: pointer
-                                    .distance(
-                                        center
-                                            + vec2(element.position[0], element.position[1])
-                                                * radius,
-                                    )
-                                    .max(1.0),
-                                start_size: element_size(&element.kind),
+                            resize_handle_at(pointer, bounds, rect).map(|_| {
+                                CanvasInteraction::Resize {
+                                    id,
+                                    start_distance: pointer
+                                        .distance(
+                                            center
+                                                + vec2(element.position[0], element.position[1])
+                                                    * radius,
+                                        )
+                                        .max(1.0),
+                                    start_size: element_size(&element.kind),
+                                }
                             })
                         });
                         let interaction = resize.or_else(|| {
@@ -562,6 +613,7 @@ impl ButtonStudio {
                         resize_handle_at(
                             pointer,
                             selection_bounds(&painter, center, radius, element),
+                            rect,
                         )
                         .map(|index| {
                             if index == 0 || index == 3 {
@@ -624,7 +676,7 @@ impl ButtonStudio {
                 ElementKind::Image { width, .. } => {
                     ui.label(section_label("SIZE"));
                     changed |= ui
-                        .add(egui::Slider::new(width, 0.08..=1.2).text("Width"))
+                        .add(egui::Slider::new(width, 0.08..=IMAGE_WIDTH_LIMIT).text("Width"))
                         .changed();
                 }
                 ElementKind::QrCode {
@@ -968,9 +1020,11 @@ impl ButtonStudio {
     fn background_controls(&mut self, ui: &mut Ui, context: &egui::Context) {
         ui.label(section_label("PHOTO"));
         let photo_name = self.design.background_image.as_ref().map(|image| {
-            image
-                .path
-                .file_name()
+            self.design
+                .assets
+                .get(&image.asset_id)
+                .and_then(|asset| asset.source_path.as_ref())
+                .and_then(|path| path.file_name())
                 .and_then(|name| name.to_str())
                 .unwrap_or("Backdrop image")
                 .to_owned()
@@ -1201,27 +1255,30 @@ impl ButtonStudio {
             return;
         };
 
-        let decoded = match image::open(&path) {
-            Ok(image) => image,
+        let (asset_id, aspect_ratio) = match self.design.import_asset_path(&path) {
+            Ok(imported) => imported,
             Err(error) => {
                 self.set_status(format!("Could not import image: {error}"), true);
                 return;
             }
         };
-        let (width, height) = decoded.dimensions();
-        self.history.record(self.design.clone());
-        let id = self
+        let texture = match self
             .design
-            .add_image(path.clone(), width as f32 / height.max(1) as f32);
-        match load_texture(context, id, &path) {
-            Ok(texture) => {
-                self.textures.insert(id, texture);
-                self.selected = Some(id);
-                self.tool = Tool::Select;
-                self.set_status("Image layer added", false);
+            .asset(&asset_id)
+            .and_then(|asset| load_texture(context, &asset_id, &asset.data))
+        {
+            Ok(texture) => texture,
+            Err(error) => {
+                self.set_status(error, true);
+                return;
             }
-            Err(error) => self.set_status(error, true),
-        }
+        };
+        self.history.record(self.design.clone());
+        let id = self.design.add_image(asset_id.clone(), aspect_ratio);
+        self.textures.insert(asset_id, texture);
+        self.selected = Some(id);
+        self.tool = Tool::Select;
+        self.set_status("Image layer added", false);
     }
 
     fn import_background_image(&mut self, context: &egui::Context) {
@@ -1232,26 +1289,28 @@ impl ButtonStudio {
             return;
         };
 
-        let decoded = match image::open(&path) {
-            Ok(image) => image,
+        let (asset_id, aspect_ratio) = match self.design.import_asset_path(&path) {
+            Ok(imported) => imported,
             Err(error) => {
                 self.set_status(format!("Could not import backdrop: {error}"), true);
                 return;
             }
         };
-        let texture = match load_texture(context, 0, &path) {
+        let texture = match self
+            .design
+            .asset(&asset_id)
+            .and_then(|asset| load_texture(context, &asset_id, &asset.data))
+        {
             Ok(texture) => texture,
             Err(error) => {
                 self.set_status(error, true);
                 return;
             }
         };
-        let (width, height) = decoded.dimensions();
         self.history.record(self.design.clone());
-        let id = self
-            .design
-            .set_background_image(path, width as f32 / height.max(1) as f32);
-        self.textures.insert(id, texture);
+        self.design
+            .set_background_image(asset_id.clone(), aspect_ratio);
+        self.textures.insert(asset_id, texture);
         self.set_status("Backdrop photo added", false);
     }
 
@@ -1315,7 +1374,19 @@ impl ButtonStudio {
             path.set_extension("buttonstudio");
         }
 
-        let json = match serde_json::to_vec_pretty(&self.design) {
+        const PREVIEW_SIZE: u32 = 512;
+        let preview = match render_project_preview_png(&self.design, PREVIEW_SIZE) {
+            Ok(preview) => preview,
+            Err(error) => {
+                self.set_status(format!("Could not render project preview: {error}"), true);
+                return;
+            }
+        };
+        let json = match self.design.to_project_json_with_preview(Some((
+            &preview,
+            PREVIEW_SIZE,
+            PREVIEW_SIZE,
+        ))) {
             Ok(json) => json,
             Err(error) => {
                 self.set_status(format!("Could not prepare project: {error}"), true);
@@ -1340,12 +1411,9 @@ impl ButtonStudio {
         };
         let result = fs::read(&path)
             .map_err(|error| error.to_string())
-            .and_then(|bytes| {
-                serde_json::from_slice::<Design>(&bytes).map_err(|error| error.to_string())
-            });
+            .and_then(|bytes| Design::from_project_json(&bytes, Some(&path)));
         match result {
-            Ok(mut design) => {
-                design.normalize_after_load();
+            Ok(design) => {
                 let fonts = design_fonts(&design);
                 match self.font_catalog.register_design_fonts(context, &fonts) {
                     Ok(()) => {
@@ -1362,23 +1430,25 @@ impl ButtonStudio {
 
     fn reload_textures(&mut self, context: &egui::Context) {
         self.textures.clear();
-        if let Some(background_image) = &self.design.background_image
-            && let Ok(texture) = load_texture(context, background_image.id, &background_image.path)
-        {
-            self.textures.insert(background_image.id, texture);
-        }
-        let images = self
+        let mut asset_ids = self
             .design
             .elements
             .iter()
             .filter_map(|element| match &element.kind {
-                ElementKind::Image { path, .. } => Some((element.id, path.clone())),
+                ElementKind::Image { asset_id, .. } => Some(asset_id.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        for (id, path) in images {
-            if let Ok(texture) = load_texture(context, id, &path) {
-                self.textures.insert(id, texture);
+        if let Some(background_image) = &self.design.background_image {
+            asset_ids.push(background_image.asset_id.clone());
+        }
+        asset_ids.sort_unstable();
+        asset_ids.dedup();
+        for asset_id in asset_ids {
+            if let Ok(asset) = self.design.asset(&asset_id)
+                && let Ok(texture) = load_texture(context, &asset_id, &asset.data)
+            {
+                self.textures.insert(asset_id, texture);
             }
         }
     }
@@ -1580,9 +1650,6 @@ impl ButtonStudio {
         };
         self.history.record(self.design.clone());
         if let Some(new_id) = self.design.duplicate(id) {
-            if let Some(texture) = self.textures.get(&id).cloned() {
-                self.textures.insert(new_id, texture);
-            }
             self.selected = Some(new_id);
             self.set_status("Layer duplicated", false);
         }
@@ -1638,6 +1705,7 @@ impl ButtonStudio {
 
 impl eframe::App for ButtonStudio {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.pull_shared_document(ui.ctx());
         self.apply_pending_updates(ui.ctx());
         self.handle_shortcuts(ui.ctx());
         self.top_bar(ui);
@@ -1645,6 +1713,7 @@ impl eframe::App for ButtonStudio {
         self.right_panel(ui);
         self.canvas(ui);
         self.font_browser(ui.ctx());
+        self.publish_shared_document(ui.ctx());
     }
 }
 
@@ -1750,15 +1819,14 @@ fn text_arc_controls(ui: &mut Ui, curvature: &mut f32) -> bool {
     changed
 }
 
-fn resize_handle_at(pointer: egui::Pos2, bounds: egui::Rect) -> Option<usize> {
-    [
-        bounds.left_top(),
-        bounds.right_top(),
-        bounds.left_bottom(),
-        bounds.right_bottom(),
-    ]
-    .into_iter()
-    .position(|handle| handle.distance(pointer) <= 13.0)
+fn resize_handle_at(
+    pointer: egui::Pos2,
+    bounds: egui::Rect,
+    canvas_rect: egui::Rect,
+) -> Option<usize> {
+    selection_handles(bounds, canvas_rect)
+        .into_iter()
+        .position(|handle| handle.distance(pointer) <= 13.0)
 }
 
 fn element_size(kind: &ElementKind) -> f32 {
@@ -1776,7 +1844,7 @@ fn set_element_size(kind: &mut ElementKind, size: f32) {
         ElementKind::Shape {
             size: shape_size, ..
         } => *shape_size = size.clamp(0.06, 0.68),
-        ElementKind::Image { width, .. } => *width = size.clamp(0.08, 1.2),
+        ElementKind::Image { width, .. } => *width = size.clamp(0.08, IMAGE_WIDTH_LIMIT),
         ElementKind::QrCode { size: qr_size, .. } => *qr_size = size.clamp(0.08, 1.2),
     }
 }
@@ -1876,9 +1944,28 @@ mod tests {
     #[test]
     fn resize_handles_are_hit_near_corners_only() {
         let bounds = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 80.0));
+        let canvas_rect = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(120.0, 100.0));
 
-        assert_eq!(resize_handle_at(egui::pos2(13.0, 22.0), bounds), Some(0));
-        assert_eq!(resize_handle_at(bounds.center(), bounds), None);
+        assert_eq!(
+            resize_handle_at(egui::pos2(13.0, 22.0), bounds, canvas_rect),
+            Some(0)
+        );
+        assert_eq!(resize_handle_at(bounds.center(), bounds, canvas_rect), None);
+    }
+
+    #[test]
+    fn resize_handles_remain_reachable_for_oversized_elements() {
+        let canvas_rect = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(100.0, 100.0));
+        let bounds = egui::Rect::from_min_max(egui::pos2(-50.0, -80.0), egui::pos2(150.0, 180.0));
+
+        assert_eq!(
+            resize_handle_at(egui::pos2(8.0, 8.0), bounds, canvas_rect),
+            Some(0)
+        );
+        assert_eq!(
+            resize_handle_at(egui::pos2(92.0, 92.0), bounds, canvas_rect),
+            Some(3)
+        );
     }
 
     #[test]
@@ -1894,7 +1981,7 @@ mod tests {
             size: 0.2,
         };
         let mut image = ElementKind::Image {
-            path: PathBuf::from("image.png"),
+            asset_id: "image".to_owned(),
             width: 0.5,
             aspect_ratio: 1.0,
         };
@@ -1912,7 +1999,7 @@ mod tests {
 
         assert_eq!(element_size(&text), 0.2);
         assert_eq!(element_size(&shape), 0.68);
-        assert_eq!(element_size(&image), 1.2);
+        assert_eq!(element_size(&image), IMAGE_WIDTH_LIMIT);
         assert_eq!(element_size(&qr_code), 1.2);
     }
 

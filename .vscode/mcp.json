@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "button-studio": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "--quiet", "--", "--headless"],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}
