@@ -673,10 +673,17 @@ impl ButtonStudio {
                         .add(egui::Slider::new(size, 0.06..=0.68).text("Scale"))
                         .changed();
                 }
-                ElementKind::Image { width, .. } => {
+                ElementKind::Image {
+                    width,
+                    bleed_to_square,
+                    ..
+                } => {
                     ui.label(section_label("SIZE"));
                     changed |= ui
                         .add(egui::Slider::new(width, 0.08..=IMAGE_WIDTH_LIMIT).text("Width"))
+                        .changed();
+                    changed |= ui
+                        .checkbox(bleed_to_square, "Bleed edges to square")
                         .changed();
                 }
                 ElementKind::QrCode {
@@ -1984,6 +1991,7 @@ mod tests {
             asset_id: "image".to_owned(),
             width: 0.5,
             aspect_ratio: 1.0,
+            bleed_to_square: false,
         };
         let mut qr_code = ElementKind::QrCode {
             content: "https://example.com".to_owned(),

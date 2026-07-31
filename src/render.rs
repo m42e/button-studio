@@ -327,10 +327,16 @@ fn unrotated_element_bounds(
         ElementKind::Image {
             width,
             aspect_ratio,
+            bleed_to_square,
             ..
         } => {
             let width = radius * 2.0 * width;
-            Rect::from_center_size(element_center, vec2(width, width / aspect_ratio))
+            let height = if *bleed_to_square {
+                width
+            } else {
+                width / aspect_ratio
+            };
+            Rect::from_center_size(element_center, vec2(width, height))
         }
         ElementKind::QrCode { size, .. } => {
             Rect::from_center_size(element_center, Vec2::splat(radius * 2.0 * size))
@@ -735,17 +741,35 @@ fn paint_element(
                 painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
             }
         },
-        ElementKind::Image { asset_id, .. } => {
+        ElementKind::Image {
+            asset_id,
+            aspect_ratio,
+            bleed_to_square,
+            ..
+        } => {
             let bounds = unrotated_element_bounds(painter, center, radius, element);
             if let Some(texture) = textures.get(asset_id) {
-                paint_rotated_image(
-                    painter,
-                    texture.id(),
-                    bounds,
-                    position,
-                    element.rotation,
-                    Color32::WHITE.gamma_multiply(element.opacity as f32 / 255.0),
-                );
+                let tint = Color32::WHITE.gamma_multiply(element.opacity as f32 / 255.0);
+                if *bleed_to_square {
+                    paint_edge_bleed_image(
+                        painter,
+                        texture.id(),
+                        bounds,
+                        position,
+                        element.rotation,
+                        *aspect_ratio,
+                        tint,
+                    );
+                } else {
+                    paint_rotated_image(
+                        painter,
+                        texture.id(),
+                        bounds,
+                        position,
+                        element.rotation,
+                        tint,
+                    );
+                }
             } else {
                 let points = rotated_rect_points(bounds, position, element.rotation);
                 painter.add(Shape::convex_polygon(
@@ -787,13 +811,90 @@ fn paint_rotated_image(
     rotation: f32,
     color: Color32,
 ) {
+    paint_rotated_image_uv(
+        painter,
+        texture_id,
+        bounds,
+        center,
+        rotation,
+        Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+        color,
+    );
+}
+
+fn paint_edge_bleed_image(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    bounds: Rect,
+    center: Pos2,
+    rotation: f32,
+    aspect_ratio: f32,
+    color: Color32,
+) {
+    let aspect_ratio = aspect_ratio.max(0.01);
+    if aspect_ratio >= 1.0 {
+        let image_height = bounds.height() / aspect_ratio;
+        let image_bounds = Rect::from_center_size(center, vec2(bounds.width(), image_height));
+        paint_rotated_image_uv(
+            painter,
+            texture_id,
+            Rect::from_min_max(bounds.min, image_bounds.right_top()),
+            center,
+            rotation,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 0.0)),
+            color,
+        );
+        paint_rotated_image(painter, texture_id, image_bounds, center, rotation, color);
+        paint_rotated_image_uv(
+            painter,
+            texture_id,
+            Rect::from_min_max(image_bounds.left_bottom(), bounds.max),
+            center,
+            rotation,
+            Rect::from_min_max(pos2(0.0, 1.0), pos2(1.0, 1.0)),
+            color,
+        );
+    } else {
+        let image_width = bounds.width() * aspect_ratio;
+        let image_bounds = Rect::from_center_size(center, vec2(image_width, bounds.height()));
+        paint_rotated_image_uv(
+            painter,
+            texture_id,
+            Rect::from_min_max(bounds.min, image_bounds.left_bottom()),
+            center,
+            rotation,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(0.0, 1.0)),
+            color,
+        );
+        paint_rotated_image(painter, texture_id, image_bounds, center, rotation, color);
+        paint_rotated_image_uv(
+            painter,
+            texture_id,
+            Rect::from_min_max(image_bounds.right_top(), bounds.max),
+            center,
+            rotation,
+            Rect::from_min_max(pos2(1.0, 0.0), pos2(1.0, 1.0)),
+            color,
+        );
+    }
+}
+
+fn paint_rotated_image_uv(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    bounds: Rect,
+    center: Pos2,
+    rotation: f32,
+    uv_bounds: Rect,
+    color: Color32,
+) {
     let points = rotated_rect_points(bounds, center, rotation);
     let mut mesh = Mesh::with_texture(texture_id);
     for (pos, uv) in points.into_iter().zip([
-        pos2(0.0, 0.0),
-        pos2(1.0, 0.0),
-        pos2(1.0, 1.0),
-        pos2(0.0, 1.0),
+        uv_bounds.left_top(),
+        uv_bounds.right_top(),
+        uv_bounds.right_bottom(),
+        uv_bounds.left_bottom(),
     ]) {
         mesh.vertices.push(Vertex { pos, uv, color });
     }
@@ -1356,16 +1457,21 @@ fn raster_element_unrotated(
             asset_id,
             width,
             aspect_ratio,
+            bleed_to_square,
         } => {
             let source = decoded_asset(design, decoded_assets, asset_id)?;
             let target_width = (radius * 2.0 * width).max(1.0) as u32;
-            let target_height = (target_width as f32 / aspect_ratio).max(1.0) as u32;
-            let mut resized = imageops::resize(
-                source,
-                target_width,
-                target_height,
-                imageops::FilterType::Lanczos3,
-            );
+            let mut resized = if *bleed_to_square {
+                edge_bleed_square(source, target_width, *aspect_ratio)
+            } else {
+                let target_height = (target_width as f32 / aspect_ratio).max(1.0) as u32;
+                imageops::resize(
+                    source,
+                    target_width,
+                    target_height,
+                    imageops::FilterType::Lanczos3,
+                )
+            };
             for pixel in resized.pixels_mut() {
                 pixel[3] = ((pixel[3] as u16 * element.opacity as u16) / 255) as u8;
             }
@@ -1373,7 +1479,7 @@ fn raster_element_unrotated(
                 canvas,
                 &resized,
                 (x - target_width as f32 / 2.0) as i64,
-                (y - target_height as f32 / 2.0) as i64,
+                (y - resized.height() as f32 / 2.0) as i64,
             );
         }
         ElementKind::QrCode {
@@ -1396,6 +1502,30 @@ fn raster_element_unrotated(
         }
     }
     Ok(())
+}
+
+fn edge_bleed_square(source: &RgbaImage, target_size: u32, aspect_ratio: f32) -> RgbaImage {
+    let aspect_ratio = aspect_ratio.max(0.01);
+    let (width, height) = if aspect_ratio >= 1.0 {
+        (
+            target_size,
+            (target_size as f32 / aspect_ratio).round().max(1.0) as u32,
+        )
+    } else {
+        (
+            (target_size as f32 * aspect_ratio).round().max(1.0) as u32,
+            target_size,
+        )
+    };
+    let resized = imageops::resize(source, width, height, imageops::FilterType::Lanczos3);
+    let left = (target_size - width) / 2;
+    let top = (target_size - height) / 2;
+    RgbaImage::from_fn(target_size, target_size, |x, y| {
+        *resized.get_pixel(
+            x.saturating_sub(left).min(width - 1),
+            y.saturating_sub(top).min(height - 1),
+        )
+    })
 }
 
 fn decoded_asset<'a>(
@@ -1582,6 +1712,25 @@ fn confetti_color(index: usize) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_bleed_square_repeats_outer_rows() {
+        let source = RgbaImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                Rgba([255, 0, 0, 255])
+            } else {
+                Rgba([0, 0, 255, 255])
+            }
+        });
+
+        let square = edge_bleed_square(&source, 4, 2.0);
+
+        assert_eq!(square.dimensions(), (4, 4));
+        for x in 0..4 {
+            assert_eq!(square.get_pixel(x, 0), square.get_pixel(x, 1));
+            assert_eq!(square.get_pixel(x, 3), square.get_pixel(x, 2));
+        }
+    }
 
     #[test]
     fn rectangle_shape_has_three_to_two_aspect_ratio() {

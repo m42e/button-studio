@@ -98,6 +98,9 @@ struct AddImageParams {
     /// Image width relative to the artwork diameter, normally 0.05 to 4.0.
     #[serde(default)]
     width: Option<f32>,
+    /// Extend the outermost pixels to fill a square around the image.
+    #[serde(default)]
+    bleed_to_square: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -131,6 +134,9 @@ struct UpdateObjectParams {
     /// Text curvature from -1 to 1. Only valid for text objects.
     #[serde(default)]
     curvature: Option<f32>,
+    /// Extend the outermost pixels to fill a square. Only valid for image objects.
+    #[serde(default)]
+    bleed_to_square: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -308,6 +314,13 @@ impl ButtonStudioServer {
                 params.width,
                 None,
             )?;
+            if params.bleed_to_square
+                && let Some(ElementKind::Image {
+                    bleed_to_square, ..
+                }) = design.element_mut(id).map(|element| &mut element.kind)
+            {
+                *bleed_to_square = true;
+            }
             id
         };
         self.changed();
@@ -352,6 +365,7 @@ impl ButtonStudioServer {
             params.size,
             params.width,
             params.curvature,
+            params.bleed_to_square,
         );
         design.normalize_after_load();
         self.changed();
@@ -528,7 +542,7 @@ fn apply_new_object(
     if let Some(color) = color {
         element.color = parse_color(&color)?;
     }
-    update_kind(&mut element.kind, None, size, width, None)?;
+    update_kind(&mut element.kind, None, size, width, None, None)?;
     design.normalize_after_load();
     Ok(())
 }
@@ -539,6 +553,7 @@ fn update_kind(
     size: Option<f32>,
     width: Option<f32>,
     curvature: Option<f32>,
+    bleed_to_square: Option<bool>,
 ) -> Result<(), McpError> {
     match kind {
         ElementKind::Text {
@@ -556,24 +571,37 @@ fn update_kind(
             if let Some(curvature) = curvature {
                 *current = finite(curvature, "curvature")?;
             }
-            if width.is_some() {
-                return Err(invalid("width is only valid for image objects"));
+            if width.is_some() || bleed_to_square.is_some() {
+                return Err(invalid(
+                    "width and bleed_to_square are only valid for image objects",
+                ));
             }
         }
         ElementKind::Shape { size: current, .. } => {
-            if content.is_some() || curvature.is_some() || width.is_some() {
+            if content.is_some()
+                || curvature.is_some()
+                || width.is_some()
+                || bleed_to_square.is_some()
+            {
                 return Err(invalid("shape objects only support size"));
             }
             if let Some(size) = size {
                 *current = finite(size, "size")?;
             }
         }
-        ElementKind::Image { width: current, .. } => {
+        ElementKind::Image {
+            width: current,
+            bleed_to_square: current_bleed,
+            ..
+        } => {
             if content.is_some() || size.is_some() || curvature.is_some() {
                 return Err(invalid("image objects use width, not content or size"));
             }
             if let Some(width) = width {
                 *current = finite(width, "width")?;
+            }
+            if let Some(bleed_to_square) = bleed_to_square {
+                *current_bleed = bleed_to_square;
             }
         }
         ElementKind::QrCode {
@@ -587,7 +615,7 @@ fn update_kind(
             if let Some(size) = size {
                 *current_size = finite(size, "size")?;
             }
-            if width.is_some() || curvature.is_some() {
+            if width.is_some() || curvature.is_some() || bleed_to_square.is_some() {
                 return Err(invalid("QR objects do not support width or curvature"));
             }
         }
@@ -733,6 +761,7 @@ mod tests {
                 size: None,
                 width: None,
                 curvature: None,
+                bleed_to_square: None,
             }))
             .unwrap();
 

@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const PROJECT_VERSION: u32 = 8;
+pub const PROJECT_VERSION: u32 = 9;
 pub const ELEMENT_POSITION_LIMIT: f32 = 1.0;
 pub const IMAGE_WIDTH_LIMIT: f32 = 4.0;
 const HISTORY_LIMIT: usize = 80;
@@ -196,6 +196,8 @@ pub enum ElementKind {
         asset_id: String,
         width: f32,
         aspect_ratio: f32,
+        #[serde(default)]
+        bleed_to_square: bool,
     },
     QrCode {
         content: String,
@@ -402,6 +404,7 @@ impl Design {
                 asset_id,
                 width: 0.5,
                 aspect_ratio: aspect_ratio.max(0.01),
+                bleed_to_square: false,
             },
         });
         id
@@ -808,6 +811,27 @@ mod tests {
         let restored: Design = serde_json::from_str(&json).expect("deserialize design");
 
         assert_eq!(restored, design);
+    }
+
+    #[test]
+    fn image_bleed_defaults_off_when_missing_from_project() {
+        let mut design = Design::default();
+        design.add_image("asset".to_owned(), 2.0);
+        let mut value = serde_json::to_value(design).expect("serialize design");
+        value["elements"][2]["kind"]
+            .as_object_mut()
+            .expect("image kind")
+            .remove("bleed_to_square");
+
+        let restored: Design = serde_json::from_value(value).expect("deserialize old design");
+
+        assert!(matches!(
+            restored.elements[2].kind,
+            ElementKind::Image {
+                bleed_to_square: false,
+                ..
+            }
+        ));
     }
 
     #[test]
