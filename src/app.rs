@@ -17,15 +17,19 @@ use eframe::egui::{
     self, Align, Button, Color32, Frame, Key, Layout, RichText, ScrollArea, Sense, Stroke,
     StrokeKind, Ui, Vec2, vec2,
 };
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::mpsc::{self, Receiver},
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
     Select,
     Text,
     Shape,
-    Image,
     QrCode,
+    Image,
     Background,
     Series,
 }
@@ -65,8 +69,8 @@ impl Tool {
         Self::Select,
         Self::Text,
         Self::Shape,
-        Self::Image,
         Self::QrCode,
+        Self::Image,
         Self::Background,
         Self::Series,
     ];
@@ -76,8 +80,8 @@ impl Tool {
             Self::Select => "Select",
             Self::Text => "Text",
             Self::Shape => "Shapes",
+            Self::QrCode => "QR code",
             Self::Image => "Images",
-            Self::QrCode => "QR Code",
             Self::Background => "Backdrop",
             Self::Series => "Series",
         }
@@ -88,8 +92,8 @@ impl Tool {
             Self::Select => "mouse-pointer-2",
             Self::Text => "type",
             Self::Shape => "shapes",
-            Self::Image => "image-plus",
             Self::QrCode => "qr-code",
+            Self::Image => "image-plus",
             Self::Background => "palette",
             Self::Series => "table-2",
         }
@@ -98,15 +102,16 @@ impl Tool {
 
 pub struct ButtonStudio {
     design: Design,
-    shared_document: Option<SharedDocument>,
-    shared_revision: u64,
+    document: SharedDocument,
+    document_revision: u64,
     history: History,
     selected: Option<u64>,
-    alignment_reference: Option<u64>,
     tool: Tool,
     draft_text: String,
     draft_text_curvature: f32,
-    draft_qr_content: String,
+    draft_qr: String,
+    series_data: Option<SeriesData>,
+    align_reference: Option<u64>,
     textures: TextureMap,
     project_path: Option<PathBuf>,
     status: String,
@@ -120,25 +125,43 @@ pub struct ButtonStudio {
     focus_font_search: bool,
     pending_font_change: Option<(u64, TextFont)>,
     pending_project: Option<(Design, PathBuf)>,
-    series: Option<SeriesData>,
+    project_paths: Receiver<PathBuf>,
 }
 
 impl ButtonStudio {
     pub fn new(context: &eframe::CreationContext<'_>) -> Self {
+        Self::with_document(context, SharedDocument::new(Design::default()))
+    }
+
+    pub fn with_document(context: &eframe::CreationContext<'_>, document: SharedDocument) -> Self {
+        let (_, project_paths) = mpsc::channel();
+        Self::with_document_and_project_paths(context, document, project_paths)
+    }
+
+    pub fn with_document_and_project_paths(
+        context: &eframe::CreationContext<'_>,
+        document: SharedDocument,
+        project_paths: Receiver<PathBuf>,
+    ) -> Self {
         crate::theme::install(&context.egui_ctx);
         let font_catalog = FontCatalog::discover();
         let font_count = font_catalog.available.len();
+        let (design, document_revision) = document
+            .snapshot()
+            .unwrap_or_else(|_| (Design::default(), 0));
+        let selected = design.elements.last().map(|element| element.id);
         Self {
-            design: Design::default(),
-            shared_document: None,
-            shared_revision: 0,
+            design,
+            document,
+            document_revision,
             history: History::default(),
-            selected: Some(2),
-            alignment_reference: None,
+            selected,
             tool: Tool::Select,
             draft_text: "YOUR TEXT".to_owned(),
             draft_text_curvature: 0.0,
-            draft_qr_content: "https://example.com".to_owned(),
+            draft_qr: "https://example.com".to_owned(),
+            series_data: None,
+            align_reference: None,
             textures: TextureMap::default(),
             project_path: None,
             status: format!("Ready · {font_count} fonts available"),
@@ -152,37 +175,24 @@ impl ButtonStudio {
             focus_font_search: false,
             pending_font_change: None,
             pending_project: None,
-            series: None,
+            project_paths,
         }
     }
 
-    pub fn with_document(
-        context: &eframe::CreationContext<'_>,
-        shared_document: SharedDocument,
-    ) -> Self {
-        let mut app = Self::new(context);
-        if let Ok((design, revision)) = shared_document.snapshot() {
-            app.design = design;
-            app.shared_revision = revision;
-            app.reload_textures(&context.egui_ctx);
+    fn sync_from_document(&mut self, context: &egui::Context) {
+        let Ok((design, revision)) = self.document.snapshot() else {
+            return;
+        };
+        if revision == self.document_revision {
+            return;
         }
-        app.shared_document = Some(shared_document);
-        app
-    }
-
-    fn pull_shared_document(&mut self, context: &egui::Context) {
-        let Some(shared_document) = &self.shared_document else {
-            return;
-        };
-        let Ok((design, revision)) = shared_document.snapshot() else {
-            return;
-        };
-        if revision == self.shared_revision {
+        if design == self.design {
+            self.document_revision = revision;
             return;
         }
         self.history.record(self.design.clone());
         self.design = design;
-        self.shared_revision = revision;
+        self.document_revision = revision;
         self.selected = self
             .selected
             .filter(|id| self.design.element(*id).is_some())
@@ -191,13 +201,12 @@ impl ButtonStudio {
         self.set_status("Design updated through MCP", false);
     }
 
-    fn publish_shared_document(&mut self, context: &egui::Context) {
-        let Some(shared_document) = &self.shared_document else {
-            return;
-        };
-        match shared_document.replace_if_revision(self.shared_revision, &self.design) {
-            Ok(revision) => self.shared_revision = revision,
-            Err(_) => context.request_repaint(),
+    fn publish_to_document(&mut self) {
+        if let Ok(revision) = self
+            .document
+            .replace_if_revision(self.document_revision, &self.design)
+        {
+            self.document_revision = revision;
         }
     }
 
@@ -251,30 +260,6 @@ impl ButtonStudio {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (pdf_label, pdf_tooltip) = if let Some(series) = &self.series {
-                            (
-                                "Export series",
-                                format!(
-                                    "Export one full-size button for each of {} CSV entries",
-                                    series.rows.len()
-                                ),
-                            )
-                        } else {
-                            (
-                                "Export PDF",
-                                "Fill an A4 PDF with full-size print-ready buttons".to_owned(),
-                            )
-                        };
-                        if ui
-                            .add(
-                                Button::new(icon_text("files", pdf_label))
-                                    .min_size(vec2(118.0, 40.0)),
-                            )
-                            .on_hover_text(pdf_tooltip)
-                            .clicked()
-                        {
-                            self.export_pdf();
-                        }
                         if ui
                             .add(
                                 Button::new(
@@ -289,6 +274,25 @@ impl ButtonStudio {
                             .clicked()
                         {
                             self.export_design();
+                        }
+                        if ui
+                            .add(
+                                Button::new(
+                                    RichText::new(icon_text("printer", "Export PDF"))
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(MINT)
+                                .min_size(vec2(126.0, 40.0)),
+                            )
+                            .on_hover_text(if self.series_data.is_some() {
+                                "Export one personalized button per CSV row"
+                            } else {
+                                "Export a print-ready A4 sheet"
+                            })
+                            .clicked()
+                        {
+                            self.export_pdf_design();
                         }
                         if ui
                             .add(Button::new(icon_text("save", "Save")).min_size(vec2(88.0, 40.0)))
@@ -374,8 +378,8 @@ impl ButtonStudio {
                             Tool::Select => self.selection_controls(ui),
                             Tool::Text => self.text_controls(ui),
                             Tool::Shape => self.shape_controls(ui),
-                            Tool::Image => self.image_controls(ui, &context),
                             Tool::QrCode => self.qr_code_controls(ui),
+                            Tool::Image => self.image_controls(ui, &context),
                             Tool::Background => self.background_controls(ui, &context),
                             Tool::Series => self.series_controls(ui),
                         }
@@ -410,12 +414,7 @@ impl ButtonStudio {
                         let width = ui.available_width();
                         let (rect, _) =
                             ui.allocate_exact_size(vec2(width, width * 0.96), Sense::hover());
-                        paint_preview(
-                            ui.painter(),
-                            rect,
-                            &self.design,
-                            &self.textures,
-                        );
+                        paint_preview(ui.painter(), rect, &self.design, &self.textures);
 
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
@@ -510,11 +509,7 @@ impl ButtonStudio {
 
                     let center = rect.center();
                     let radius = side * 0.405;
-                    painter.circle_filled(
-                        center + vec2(0.0, 10.0),
-                        radius + 4.0,
-                        Color32::from_black_alpha(28),
-                    );
+                    painter.circle_filled(center, radius + 4.0, Color32::from_black_alpha(28));
                     paint_design(
                         &painter,
                         center,
@@ -694,18 +689,16 @@ impl ButtonStudio {
                 } => {
                     ui.label(section_label("CONTENT"));
                     changed |= ui.text_edit_multiline(content).changed();
-                    ui.add_space(6.0);
                     ui.label(section_label("SIZE"));
                     changed |= ui
                         .add(egui::Slider::new(size, 0.08..=1.2).text("Scale"))
                         .changed();
-                    ui.add_space(6.0);
-                    ui.label(section_label("BACKGROUND"));
                     changed |= ui
-                        .checkbox(transparent_background, "Fully transparent")
+                        .checkbox(transparent_background, "Transparent background")
                         .changed();
                     if !*transparent_background {
                         let mut background_color: Color32 = (*background).into();
+                        ui.label(section_label("QR BACKGROUND"));
                         if ui.color_edit_button_srgba(&mut background_color).changed() {
                             *background = background_color.into();
                             changed = true;
@@ -734,7 +727,6 @@ impl ButtonStudio {
                     .text("Y"),
                 )
                 .changed();
-
             ui.add_space(6.0);
             ui.label(section_label("ROTATION"));
             changed |= ui
@@ -762,18 +754,18 @@ impl ButtonStudio {
             changed |= ui.checkbox(&mut element.visible, "Visible").changed();
         }
 
-        if self.alignment_reference == Some(id)
+        if self.align_reference == Some(id)
             || self
-                .alignment_reference
+                .align_reference
                 .is_some_and(|reference| self.design.element(reference).is_none())
         {
-            self.alignment_reference = None;
+            self.align_reference = None;
         }
 
         ui.add_space(6.0);
         ui.label(section_label("ALIGN"));
         let reference_label = self
-            .alignment_reference
+            .align_reference
             .and_then(|reference| self.design.element(reference))
             .map(|element| truncate(&element.name(), 24))
             .unwrap_or_else(|| "Artwork page".to_owned());
@@ -781,7 +773,7 @@ impl ButtonStudio {
             .selected_text(reference_label)
             .width(ui.available_width())
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.alignment_reference, None, "Artwork page");
+                ui.selectable_value(&mut self.align_reference, None, "Artwork page");
                 for element in self
                     .design
                     .elements
@@ -789,7 +781,7 @@ impl ButtonStudio {
                     .filter(|element| element.id != id)
                 {
                     ui.selectable_value(
-                        &mut self.alignment_reference,
+                        &mut self.align_reference,
                         Some(element.id),
                         truncate(&element.name(), 24),
                     );
@@ -830,7 +822,7 @@ impl ButtonStudio {
                 &mut self.design,
                 &painter,
                 id,
-                self.alignment_reference,
+                self.align_reference,
                 alignment,
             ) {
                 changed = true;
@@ -923,6 +915,100 @@ impl ButtonStudio {
             });
     }
 
+    fn qr_code_controls(&mut self, ui: &mut Ui) {
+        ui.label(section_label("DESTINATION OR CONTENT"));
+        ui.text_edit_multiline(&mut self.draft_qr);
+        if ui
+            .add_enabled(
+                !self.draft_qr.trim().is_empty(),
+                Button::new(RichText::new(icon_text("plus", "Add QR code")).color(Color32::WHITE))
+                    .fill(INK),
+            )
+            .clicked()
+        {
+            self.history.record(self.design.clone());
+            let id = self.design.add_qr_code(self.draft_qr.trim().to_owned());
+            self.selected = Some(id);
+            self.tool = Tool::Select;
+            self.set_status("QR code added", false);
+        }
+    }
+
+    fn series_controls(&mut self, ui: &mut Ui) {
+        let selected = self.selected;
+        if let Some(series) = &self.series_data {
+            ui.label(RichText::new(&series.source_name).strong());
+            ui.label(
+                RichText::new(format!(
+                    "{} rows · {} columns",
+                    series.rows.len(),
+                    series.columns.len()
+                ))
+                .color(MUTED),
+            );
+            ui.add_space(8.0);
+            ui.label(section_label("INSERT VARIABLE"));
+            let columns = series.columns.clone();
+            let mut inserted = None;
+            ui.horizontal_wrapped(|ui| {
+                for column in columns {
+                    if ui.button(format!("{{{{{column}}}}}")).clicked() {
+                        inserted = Some(column);
+                    }
+                }
+            });
+            if let (Some(id), Some(column)) = (selected, inserted) {
+                let previous = self.design.clone();
+                if let Some(element) = self.design.element_mut(id) {
+                    let content = match &mut element.kind {
+                        ElementKind::Text { text, .. } => Some(text),
+                        ElementKind::QrCode { content, .. } => Some(content),
+                        _ => None,
+                    };
+                    if let Some(content) = content {
+                        if !content.is_empty() && !content.ends_with(char::is_whitespace) {
+                            content.push(' ');
+                        }
+                        content.push_str(&format!("{{{{{column}}}}}"));
+                        self.history.record(previous);
+                        self.set_status("Series variable inserted", false);
+                    } else {
+                        self.set_status("Select a text or QR layer first", true);
+                    }
+                }
+            }
+            ui.add_space(10.0);
+            if ui
+                .add_sized(
+                    [ui.available_width(), 42.0],
+                    Button::new(icon_text("printer", "Export series PDF")),
+                )
+                .clicked()
+            {
+                self.export_pdf_design();
+            }
+            if ui.button(icon_text("x", "Remove series data")).clicked() {
+                self.series_data = None;
+                self.set_status("Series data removed", false);
+            }
+        } else {
+            ui.label(RichText::new("Import CSV, TSV, or semicolon-separated data.").color(MUTED));
+            if ui
+                .add_sized(
+                    [ui.available_width(), 48.0],
+                    Button::new(
+                        RichText::new(icon_text("table-2", "Import series data"))
+                            .color(Color32::WHITE),
+                    )
+                    .fill(INK),
+                )
+                .clicked()
+            {
+                self.import_series();
+            }
+        }
+    }
+
     fn image_controls(&mut self, ui: &mut Ui, context: &egui::Context) {
         ui.label(section_label("ARTWORK"));
         if ui
@@ -951,86 +1037,13 @@ impl ButtonStudio {
         });
     }
 
-    fn qr_code_controls(&mut self, ui: &mut Ui) {
-        ui.label(section_label("CONTENT"));
-        ui.text_edit_multiline(&mut self.draft_qr_content);
-        ui.label(
-            RichText::new("URL, text, contact details, or any other QR content")
-                .size(11.0)
-                .color(MUTED),
-        );
-        ui.add_space(8.0);
-        if ui
-            .add_enabled(
-                !self.draft_qr_content.trim().is_empty(),
-                Button::new(RichText::new(icon_text("plus", "Add QR code")).color(Color32::WHITE))
-                    .fill(INK),
-            )
-            .clicked()
-        {
-            self.history.record(self.design.clone());
-            let id = self
-                .design
-                .add_qr_code(self.draft_qr_content.trim().to_owned());
-            self.selected = Some(id);
-            self.tool = Tool::Select;
-            self.set_status("QR code layer added", false);
-        }
-    }
-
-    fn series_controls(&mut self, ui: &mut Ui) {
-        ui.label(section_label("CSV DATA"));
-        if ui
-            .add_sized(
-                [ui.available_width(), 46.0],
-                Button::new(RichText::new(icon_text("upload", "Import CSV")).color(Color32::WHITE))
-                    .fill(INK),
-            )
-            .clicked()
-        {
-            self.import_series();
-        }
-
-        let Some(series) = &self.series else {
-            ui.label(RichText::new("No series loaded").color(MUTED));
-            return;
-        };
-        let source_name = series.source_name.clone();
-        let row_count = series.rows.len();
-        let columns = series.columns.clone();
-        ui.add_space(8.0);
-        ui.label(RichText::new(truncate(&source_name, 30)).strong());
-        ui.label(RichText::new(format!("{row_count} entries")).color(MUTED));
-        if ui.button(icon_text("x", "Remove data")).clicked() {
-            self.series = None;
-            self.set_status("Series data removed", false);
-            return;
-        }
-
-        ui.add_space(12.0);
-        ui.label(section_label("VARIABLES"));
-        for column in columns {
-            let placeholder = format!("{{{{{column}}}}}");
-            if ui
-                .add_sized(
-                    [ui.available_width(), 34.0],
-                    Button::new(icon_text("plus", &placeholder)),
-                )
-                .on_hover_text("Insert into the selected text or QR layer")
-                .clicked()
-            {
-                self.insert_series_variable(&placeholder);
-            }
-        }
-    }
-
     fn background_controls(&mut self, ui: &mut Ui, context: &egui::Context) {
         ui.label(section_label("PHOTO"));
         let photo_name = self.design.background_image.as_ref().map(|image| {
             self.design
                 .assets
                 .get(&image.asset_id)
-                .and_then(|asset| asset.source_path.as_ref())
+                .and_then(|asset| asset.source_path.as_deref())
                 .and_then(|path| path.file_name())
                 .and_then(|name| name.to_str())
                 .unwrap_or("Backdrop image")
@@ -1092,34 +1105,28 @@ impl ButtonStudio {
             });
 
         ui.add_space(12.0);
-        ui.add_enabled_ui(
-            self.design.background_style != BackgroundStyle::None,
-            |ui| {
-                ui.label(section_label("COLOR"));
-                let mut color: Color32 = self.design.background.into();
-                if ui.color_edit_button_srgba(&mut color).changed() {
-                    self.design.background = color.into();
+        ui.label(section_label("COLOR"));
+        let mut color: Color32 = self.design.background.into();
+        if ui.color_edit_button_srgba(&mut color).changed() {
+            self.design.background = color.into();
+            changed = true;
+        }
+        ui.horizontal_wrapped(|ui| {
+            for swatch in palette() {
+                let (rect, response) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
+                ui.painter()
+                    .circle_filled(rect.center(), 14.0, Color32::from(swatch));
+                ui.painter().circle_stroke(
+                    rect.center(),
+                    14.0,
+                    Stroke::new(1.0, Color32::from_black_alpha(42)),
+                );
+                if response.clicked() {
+                    self.design.background = swatch;
                     changed = true;
                 }
-                ui.horizontal_wrapped(|ui| {
-                    for swatch in palette() {
-                        let (rect, response) =
-                            ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
-                        ui.painter()
-                            .circle_filled(rect.center(), 14.0, Color32::from(swatch));
-                        ui.painter().circle_stroke(
-                            rect.center(),
-                            14.0,
-                            Stroke::new(1.0, Color32::from_black_alpha(42)),
-                        );
-                        if response.clicked() {
-                            self.design.background = swatch;
-                            changed = true;
-                        }
-                    }
-                });
-            },
-        );
+            }
+        });
 
         if changed {
             self.history.record(previous);
@@ -1262,30 +1269,32 @@ impl ButtonStudio {
             return;
         };
 
+        let previous = self.design.clone();
         let (asset_id, aspect_ratio) = match self.design.import_asset_path(&path) {
-            Ok(imported) => imported,
+            Ok(asset) => asset,
             Err(error) => {
                 self.set_status(format!("Could not import image: {error}"), true);
                 return;
             }
         };
-        let texture = match self
+        let texture = self
             .design
             .asset(&asset_id)
-            .and_then(|asset| load_texture(context, &asset_id, &asset.data))
-        {
-            Ok(texture) => texture,
-            Err(error) => {
-                self.set_status(error, true);
-                return;
+            .and_then(|asset| load_texture(context, &asset_id, &asset.data));
+        match texture {
+            Ok(texture) => {
+                let id = self.design.add_image(asset_id.clone(), aspect_ratio);
+                self.history.record(previous);
+                self.textures.insert(asset_id, texture);
+                self.selected = Some(id);
+                self.tool = Tool::Select;
+                self.set_status("Image layer added", false);
             }
-        };
-        self.history.record(self.design.clone());
-        let id = self.design.add_image(asset_id.clone(), aspect_ratio);
-        self.textures.insert(asset_id, texture);
-        self.selected = Some(id);
-        self.tool = Tool::Select;
-        self.set_status("Image layer added", false);
+            Err(error) => {
+                self.design = previous;
+                self.set_status(error, true);
+            }
+        }
     }
 
     fn import_background_image(&mut self, context: &egui::Context) {
@@ -1296,8 +1305,9 @@ impl ButtonStudio {
             return;
         };
 
+        let previous = self.design.clone();
         let (asset_id, aspect_ratio) = match self.design.import_asset_path(&path) {
-            Ok(imported) => imported,
+            Ok(asset) => asset,
             Err(error) => {
                 self.set_status(format!("Could not import backdrop: {error}"), true);
                 return;
@@ -1310,61 +1320,33 @@ impl ButtonStudio {
         {
             Ok(texture) => texture,
             Err(error) => {
+                self.design = previous;
                 self.set_status(error, true);
                 return;
             }
         };
-        self.history.record(self.design.clone());
         self.design
             .set_background_image(asset_id.clone(), aspect_ratio);
+        self.history.record(previous);
         self.textures.insert(asset_id, texture);
         self.set_status("Backdrop photo added", false);
     }
 
     fn import_series(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("CSV data", &["csv", "tsv"])
+            .add_filter("Delimited data", &["csv", "tsv", "txt"])
             .pick_file()
         else {
             return;
         };
         match SeriesData::from_path(&path) {
             Ok(series) => {
-                let row_count = series.rows.len();
-                let column_count = series.columns.len();
-                self.series = Some(series);
-                self.set_status(
-                    format!("Loaded {row_count} entries with {column_count} variables"),
-                    false,
-                );
+                let rows = series.rows.len();
+                self.series_data = Some(series);
+                self.set_status(format!("Imported {rows} series rows"), false);
             }
             Err(error) => self.set_status(error, true),
         }
-    }
-
-    fn insert_series_variable(&mut self, placeholder: &str) {
-        let Some(id) = self.selected else {
-            self.set_status("Select a text or QR layer first", true);
-            return;
-        };
-        let previous = self.design.clone();
-        let Some(element) = self.design.element_mut(id) else {
-            return;
-        };
-        let content = match &mut element.kind {
-            ElementKind::Text { text, .. } => text,
-            ElementKind::QrCode { content, .. } => content,
-            _ => {
-                self.set_status("Variables can be inserted into text or QR layers", true);
-                return;
-            }
-        };
-        if !content.is_empty() && !content.ends_with(char::is_whitespace) {
-            content.push(' ');
-        }
-        content.push_str(placeholder);
-        self.history.record(previous);
-        self.set_status(format!("Inserted {placeholder}"), false);
     }
 
     fn save_project(&mut self) {
@@ -1381,19 +1363,17 @@ impl ButtonStudio {
             path.set_extension("buttonstudio");
         }
 
-        const PREVIEW_SIZE: u32 = 512;
-        let preview = match render_project_preview_png(&self.design, PREVIEW_SIZE) {
+        let preview = match render_project_preview_png(&self.design, 512) {
             Ok(preview) => preview,
             Err(error) => {
-                self.set_status(format!("Could not render project preview: {error}"), true);
+                self.set_status(format!("Could not prepare project preview: {error}"), true);
                 return;
             }
         };
-        let json = match self.design.to_project_json_with_preview(Some((
-            &preview,
-            PREVIEW_SIZE,
-            PREVIEW_SIZE,
-        ))) {
+        let json = match self
+            .design
+            .to_project_json_with_preview(Some((&preview, 512, 512)))
+        {
             Ok(json) => json,
             Err(error) => {
                 self.set_status(format!("Could not prepare project: {error}"), true);
@@ -1416,6 +1396,10 @@ impl ButtonStudio {
         else {
             return;
         };
+        self.open_project_path(context, path);
+    }
+
+    pub fn open_project_path(&mut self, context: &egui::Context, path: PathBuf) {
         let result = fs::read(&path)
             .map_err(|error| error.to_string())
             .and_then(|bytes| Design::from_project_json(&bytes, Some(&path)));
@@ -1435,26 +1419,22 @@ impl ButtonStudio {
         }
     }
 
+    fn open_external_project(&mut self, context: &egui::Context) {
+        if let Some(path) = self.project_paths.try_iter().last() {
+            self.open_project_path(context, path);
+        }
+    }
+
     fn reload_textures(&mut self, context: &egui::Context) {
         self.textures.clear();
-        let mut asset_ids = self
+        let assets = self
             .design
-            .elements
+            .assets
             .iter()
-            .filter_map(|element| match &element.kind {
-                ElementKind::Image { asset_id, .. } => Some(asset_id.clone()),
-                _ => None,
-            })
+            .map(|(asset_id, asset)| (asset_id.clone(), asset.data.clone()))
             .collect::<Vec<_>>();
-        if let Some(background_image) = &self.design.background_image {
-            asset_ids.push(background_image.asset_id.clone());
-        }
-        asset_ids.sort_unstable();
-        asset_ids.dedup();
-        for asset_id in asset_ids {
-            if let Ok(asset) = self.design.asset(&asset_id)
-                && let Ok(texture) = load_texture(context, &asset_id, &asset.data)
-            {
+        for (asset_id, data) in assets {
+            if let Ok(texture) = load_texture(context, &asset_id, &data) {
                 self.textures.insert(asset_id, texture);
             }
         }
@@ -1602,13 +1582,12 @@ impl ButtonStudio {
         }
     }
 
-    fn export_pdf(&mut self) {
-        let kind = if self.series.is_some() {
-            "series"
+    fn export_pdf_design(&mut self) {
+        let file_name = if self.series_data.is_some() {
+            format!("button-series-{}mm.pdf", self.design.diameter_mm)
         } else {
-            "sheet"
+            format!("button-sheet-{}mm.pdf", self.design.diameter_mm)
         };
-        let file_name = format!("button-{}mm-{kind}.pdf", self.design.diameter_mm);
         let Some(mut path) = rfd::FileDialog::new()
             .add_filter("PDF document", &["pdf"])
             .set_file_name(&file_name)
@@ -1619,11 +1598,11 @@ impl ButtonStudio {
         if path.extension().is_none() {
             path.set_extension("pdf");
         }
-        if let Some(series) = &self.series {
+        if let Some(series) = &self.series_data {
             match export_pdf_series(&self.design, &series.rows, &path) {
                 Ok(summary) => self.set_status(
                     format!(
-                        "Exported {} personalized buttons across {} A4 pages",
+                        "Exported {} personalized buttons across {} PDF pages",
                         summary.buttons, summary.pages
                     ),
                     false,
@@ -1632,10 +1611,7 @@ impl ButtonStudio {
             }
         } else {
             match export_pdf_sheet(&self.design, &path) {
-                Ok(count) => self.set_status(
-                    format!("Exported A4 PDF with {count} full-size buttons"),
-                    false,
-                ),
+                Ok(buttons) => self.set_status(format!("Exported {buttons} buttons to PDF"), false),
                 Err(error) => self.set_status(error, true),
             }
         }
@@ -1712,7 +1688,8 @@ impl ButtonStudio {
 
 impl eframe::App for ButtonStudio {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        self.pull_shared_document(ui.ctx());
+        self.open_external_project(ui.ctx());
+        self.sync_from_document(ui.ctx());
         self.apply_pending_updates(ui.ctx());
         self.handle_shortcuts(ui.ctx());
         self.top_bar(ui);
@@ -1720,7 +1697,7 @@ impl eframe::App for ButtonStudio {
         self.right_panel(ui);
         self.canvas(ui);
         self.font_browser(ui.ctx());
-        self.publish_shared_document(ui.ctx());
+        self.publish_to_document();
     }
 }
 
@@ -1988,14 +1965,14 @@ mod tests {
             size: 0.2,
         };
         let mut image = ElementKind::Image {
-            asset_id: "image".to_owned(),
+            asset_id: "asset".to_owned(),
             width: 0.5,
             aspect_ratio: 1.0,
             bleed_to_square: false,
         };
         let mut qr_code = ElementKind::QrCode {
             content: "https://example.com".to_owned(),
-            size: 0.46,
+            size: 0.5,
             background: DesignColor::WHITE,
             transparent_background: false,
         };

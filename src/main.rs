@@ -1,5 +1,10 @@
 use button_studio::app::ButtonStudio;
 use button_studio::{document::SharedDocument, model::Design};
+use std::path::PathBuf;
+use std::sync::mpsc;
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 #[path = "bin/button-studio-mcp.rs"]
 mod mcp;
@@ -12,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return mcp::run(mcp::ButtonStudioServer::default());
     }
 
+    let project_path = project_path_from_args(std::env::args().skip(1));
     let document = SharedDocument::new(Design::default());
     let server = mcp::ButtonStudioServer::with_document(document.clone());
     std::thread::spawn(move || {
@@ -19,11 +25,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("MCP server stopped: {error}");
         }
     });
-    run_gui(document)?;
+    run_gui(document, project_path)?;
     Ok(())
 }
 
-fn run_gui(document: SharedDocument) -> eframe::Result {
+fn project_path_from_args(arguments: impl IntoIterator<Item = String>) -> Option<PathBuf> {
+    arguments
+        .into_iter()
+        .find(|argument| !argument.starts_with('-'))
+        .map(PathBuf::from)
+}
+
+fn run_gui(document: SharedDocument, project_path: Option<PathBuf>) -> eframe::Result {
+    let (project_sender, project_receiver) = mpsc::channel();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Pincraft Button Studio")
@@ -35,6 +49,33 @@ fn run_gui(document: SharedDocument) -> eframe::Result {
     eframe::run_native(
         "Pincraft Button Studio",
         options,
-        Box::new(move |context| Ok(Box::new(ButtonStudio::with_document(context, document)))),
+        Box::new(move |context| {
+            let mut app =
+                ButtonStudio::with_document_and_project_paths(context, document, project_receiver);
+            #[cfg(target_os = "macos")]
+            macos::install_open_document_handler(project_sender, context.egui_ctx.clone());
+            if let Some(path) = project_path {
+                app.open_project_path(&context.egui_ctx, path);
+            }
+            Ok(Box::new(app))
+        }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::project_path_from_args;
+
+    #[test]
+    fn finds_document_path_after_launcher_arguments() {
+        let path = project_path_from_args([
+            "--some-launcher-flag".to_owned(),
+            "/Users/test/Downloads/my-button.buttonstudio".to_owned(),
+        ]);
+
+        assert_eq!(
+            path.and_then(|path| path.to_str().map(str::to_owned)),
+            Some("/Users/test/Downloads/my-button.buttonstudio".to_owned())
+        );
+    }
 }
