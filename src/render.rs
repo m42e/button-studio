@@ -316,14 +316,18 @@ fn unrotated_element_bounds(
                 None => Rect::from_center_size(element_center, Vec2::ZERO),
             }
         }
-        ElementKind::Shape { shape, size } => Rect::from_center_size(
-            element_center,
-            if *shape == ShapeKind::Rectangle {
-                vec2(radius * size * 2.0, radius * size * 4.0 / 3.0)
-            } else {
-                Vec2::splat(radius * size * 2.0)
-            },
-        ),
+        ElementKind::Shape {
+            shape,
+            size,
+            width,
+            height,
+        } => {
+            let (width, height) = shape_dimensions(*shape, *size, *width, *height);
+            Rect::from_center_size(
+                element_center,
+                vec2(radius * 2.0 * width, radius * 2.0 * height),
+            )
+        }
         ElementKind::Image {
             width,
             aspect_ratio,
@@ -737,21 +741,46 @@ fn paint_element(
                 );
             }
         }
-        ElementKind::Shape { shape, size } => match shape {
-            ShapeKind::Circle => {
-                painter.circle_filled(position, radius * size, color);
+        ElementKind::Shape {
+            shape,
+            size,
+            width,
+            height,
+        } => {
+            let (width, height) = shape_dimensions(*shape, *size, *width, *height);
+            let radius_x = radius * width;
+            let radius_y = radius * height;
+            match shape {
+                ShapeKind::Circle => {
+                    if (radius_x - radius_y).abs() < f32::EPSILON {
+                        painter.circle_filled(position, radius_x, color);
+                    } else {
+                        let points = ellipse_points(position, radius_x, radius_y, element.rotation);
+                        painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
+                    }
+                }
+                ShapeKind::Star => {
+                    let points = rotated_shape_points_xy(
+                        *shape,
+                        position,
+                        radius_x,
+                        radius_y,
+                        element.rotation,
+                    );
+                    paint_polygon_fan(painter, position, &points, color);
+                }
+                _ => {
+                    let points = rotated_shape_points_xy(
+                        *shape,
+                        position,
+                        radius_x,
+                        radius_y,
+                        element.rotation,
+                    );
+                    painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
+                }
             }
-            ShapeKind::Star => {
-                let points =
-                    rotated_shape_points(*shape, position, radius * size, element.rotation);
-                paint_polygon_fan(painter, position, &points, color);
-            }
-            _ => {
-                let points =
-                    rotated_shape_points(*shape, position, radius * size, element.rotation);
-                painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
-            }
-        },
+        }
         ElementKind::Image {
             asset_id,
             aspect_ratio,
@@ -1019,7 +1048,10 @@ fn compose_curved_text(
     color: Rgba<u8>,
 ) -> Option<(RgbaImage, Vec2)> {
     let tiles = crate::text_raster::render_glyph_tiles(text, scale, font, color);
-    let widths = tiles.iter().map(|(_, advance)| *advance).collect::<Vec<_>>();
+    let widths = tiles
+        .iter()
+        .map(|(_, advance)| *advance)
+        .collect::<Vec<_>>();
 
     let mut placed = Vec::new();
     let mut min = vec2(f32::INFINITY, f32::INFINITY);
@@ -1175,14 +1207,23 @@ fn paint_polygon_fan(painter: &egui::Painter, center: Pos2, points: &[Pos2], col
     painter.add(Shape::mesh(mesh));
 }
 
+#[cfg(test)]
 fn shape_points(kind: ShapeKind, center: Pos2, radius: f32) -> Vec<Pos2> {
+    shape_points_xy(kind, center, radius, radius)
+}
+
+fn shape_points_xy(kind: ShapeKind, center: Pos2, radius_x: f32, radius_y: f32) -> Vec<Pos2> {
     match kind {
         ShapeKind::Star => (0..10)
             .map(|index| {
                 let angle =
                     index as f32 * std::f32::consts::TAU / 10.0 - std::f32::consts::FRAC_PI_2;
-                let point_radius = radius * if index % 2 == 0 { 1.0 } else { 0.45 };
-                center + vec2(angle.cos(), angle.sin()) * point_radius
+                let point_radius = if index % 2 == 0 { 1.0 } else { 0.45 };
+                center
+                    + vec2(
+                        angle.cos() * point_radius * radius_x,
+                        angle.sin() * point_radius * radius_y,
+                    )
             })
             .collect(),
         ShapeKind::Heart => (0..32)
@@ -1194,20 +1235,20 @@ fn shape_points(kind: ShapeKind, center: Pos2, radius: f32) -> Vec<Pos2> {
                     - 2.0 * (3.0 * angle).cos()
                     - (4.0 * angle).cos())
                     / 17.0;
-                center + vec2(x, y) * radius
+                center + vec2(x * radius_x, y * radius_y)
             })
             .collect(),
         ShapeKind::Diamond => vec![
-            center - vec2(0.0, radius),
-            center + vec2(radius * 0.82, 0.0),
-            center + vec2(0.0, radius),
-            center - vec2(radius * 0.82, 0.0),
+            center - vec2(0.0, radius_y),
+            center + vec2(radius_x * 0.82, 0.0),
+            center + vec2(0.0, radius_y),
+            center - vec2(radius_x * 0.82, 0.0),
         ],
         ShapeKind::Rectangle => vec![
-            center + vec2(-radius, -radius * 2.0 / 3.0),
-            center + vec2(radius, -radius * 2.0 / 3.0),
-            center + vec2(radius, radius * 2.0 / 3.0),
-            center + vec2(-radius, radius * 2.0 / 3.0),
+            center + vec2(-radius_x, -radius_y),
+            center + vec2(radius_x, -radius_y),
+            center + vec2(radius_x, radius_y),
+            center + vec2(-radius_x, radius_y),
         ],
         ShapeKind::Bolt => [
             (-0.15, -1.0),
@@ -1219,17 +1260,56 @@ fn shape_points(kind: ShapeKind, center: Pos2, radius: f32) -> Vec<Pos2> {
             (-0.7, 0.12),
         ]
         .into_iter()
-        .map(|(x, y)| center + vec2(x, y) * radius)
+        .map(|(x, y)| center + vec2(x * radius_x, y * radius_y))
         .collect(),
-        ShapeKind::Circle => Vec::new(),
+        ShapeKind::Circle => (0..48)
+            .map(|index| {
+                let angle = index as f32 * std::f32::consts::TAU / 48.0;
+                center + vec2(angle.cos() * radius_x, angle.sin() * radius_y)
+            })
+            .collect(),
     }
 }
 
-fn rotated_shape_points(kind: ShapeKind, center: Pos2, radius: f32, rotation: f32) -> Vec<Pos2> {
-    shape_points(kind, center, radius)
+fn rotated_shape_points_xy(
+    kind: ShapeKind,
+    center: Pos2,
+    radius_x: f32,
+    radius_y: f32,
+    rotation: f32,
+) -> Vec<Pos2> {
+    shape_points_xy(kind, center, radius_x, radius_y)
         .into_iter()
         .map(|point| rotate_point(point, center, rotation))
         .collect()
+}
+
+fn ellipse_points(center: Pos2, radius_x: f32, radius_y: f32, rotation: f32) -> Vec<Pos2> {
+    (0..48)
+        .map(|index| {
+            let angle = index as f32 * std::f32::consts::TAU / 48.0;
+            rotate_point(
+                center + vec2(angle.cos() * radius_x, angle.sin() * radius_y),
+                center,
+                rotation,
+            )
+        })
+        .collect()
+}
+
+fn shape_dimensions(
+    shape: ShapeKind,
+    size: f32,
+    width: Option<f32>,
+    height: Option<f32>,
+) -> (f32, f32) {
+    let old_width = size;
+    let old_height = if shape == ShapeKind::Rectangle {
+        size * 2.0 / 3.0
+    } else {
+        old_width
+    };
+    (width.unwrap_or(old_width), height.unwrap_or(old_height))
 }
 
 fn rotated_rect_points(bounds: Rect, center: Pos2, rotation: f32) -> Vec<Pos2> {
@@ -1447,22 +1527,18 @@ fn raster_element_unrotated(
                 );
             }
         }
-        ElementKind::Shape { shape, size } => {
-            let shape_radius = radius * size;
-            if *shape == ShapeKind::Circle {
-                draw_filled_circle_mut(
-                    canvas,
-                    (x as i32, y as i32),
-                    shape_radius as i32,
-                    rgba(color),
-                );
-            } else {
-                let points = shape_points(*shape, pos2(x, y), shape_radius)
-                    .into_iter()
-                    .map(|point| Point::new(point.x as i32, point.y as i32))
-                    .collect::<Vec<_>>();
-                draw_polygon_mut(canvas, &points, rgba(color));
-            }
+        ElementKind::Shape {
+            shape,
+            size,
+            width,
+            height,
+        } => {
+            let (width, height) = shape_dimensions(*shape, *size, *width, *height);
+            let points = shape_points_xy(*shape, pos2(x, y), radius * width, radius * height)
+                .into_iter()
+                .map(|point| Point::new(point.x as i32, point.y as i32))
+                .collect::<Vec<_>>();
+            draw_polygon_mut(canvas, &points, rgba(color));
         }
         ElementKind::Image {
             asset_id,

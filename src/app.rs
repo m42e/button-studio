@@ -44,6 +44,13 @@ enum CanvasInteraction {
         start_distance: f32,
         start_size: f32,
     },
+    ResizeShape {
+        id: u64,
+        width: f32,
+        height: f32,
+        center: egui::Pos2,
+        rotation: f32,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -59,7 +66,7 @@ enum ElementAlignment {
 impl CanvasInteraction {
     fn id(self) -> u64 {
         match self {
-            Self::Move { id } | Self::Resize { id, .. } => id,
+            Self::Move { id } | Self::Resize { id, .. } | Self::ResizeShape { id, .. } => id,
         }
     }
 }
@@ -554,16 +561,38 @@ impl ButtonStudio {
                             let element = self.design.element(id)?;
                             let bounds = selection_bounds(&painter, center, radius, element);
                             resize_handle_at(pointer, bounds, rect).map(|_| {
-                                CanvasInteraction::Resize {
-                                    id,
-                                    start_distance: pointer
-                                        .distance(
-                                            center
-                                                + vec2(element.position[0], element.position[1])
-                                                    * radius,
-                                        )
-                                        .max(1.0),
-                                    start_size: element_size(&element.kind),
+                                if let ElementKind::Shape {
+                                    shape,
+                                    size,
+                                    width,
+                                    height,
+                                } = &element.kind
+                                {
+                                    let (width, height) =
+                                        shape_layer_dimensions(*shape, *size, *width, *height);
+                                    CanvasInteraction::ResizeShape {
+                                        id,
+                                        width,
+                                        height,
+                                        center: center
+                                            + vec2(element.position[0], element.position[1])
+                                                * radius,
+                                        rotation: element.rotation,
+                                    }
+                                } else {
+                                    CanvasInteraction::Resize {
+                                        id,
+                                        start_distance: pointer
+                                            .distance(
+                                                center
+                                                    + vec2(
+                                                        element.position[0],
+                                                        element.position[1],
+                                                    ) * radius,
+                                            )
+                                            .max(1.0),
+                                        start_size: element_size(&element.kind),
+                                    }
                                 }
                             })
                         });
@@ -603,6 +632,42 @@ impl ButtonStudio {
                                     let scale = pointer.distance(element_center) / start_distance;
                                     if let Some(element) = self.design.element_mut(id) {
                                         set_element_size(&mut element.kind, start_size * scale);
+                                    }
+                                }
+                            }
+                            Some(CanvasInteraction::ResizeShape {
+                                id,
+                                width,
+                                height,
+                                center: element_center,
+                                rotation,
+                            }) => {
+                                if let Some(pointer) = response.interact_pointer_pos() {
+                                    let delta = pointer - element_center;
+                                    let angle = -rotation.to_radians();
+                                    let local = vec2(
+                                        delta.x * angle.cos() - delta.y * angle.sin(),
+                                        delta.x * angle.sin() + delta.y * angle.cos(),
+                                    );
+                                    let mut next_width = (local.x.abs() / radius).clamp(0.02, 2.0);
+                                    let mut next_height = (local.y.abs() / radius).clamp(0.02, 2.0);
+                                    if ui.input(|input| input.modifiers.shift) {
+                                        let width_scale = next_width / width;
+                                        let height_scale = next_height / height;
+                                        if (width_scale - 1.0).abs() >= (height_scale - 1.0).abs() {
+                                            next_height =
+                                                (next_width / width * height).clamp(0.02, 2.0);
+                                        } else {
+                                            next_width =
+                                                (next_height / height * width).clamp(0.02, 2.0);
+                                        }
+                                    }
+                                    if let Some(element) = self.design.element_mut(id)
+                                        && let ElementKind::Shape { width, height, .. } =
+                                            &mut element.kind
+                                    {
+                                        *width = Some(next_width);
+                                        *height = Some(next_height);
                                     }
                                 }
                             }
@@ -672,11 +737,46 @@ impl ButtonStudio {
                     ui.add_space(6.0);
                     open_font_browser = font_picker_button(ui, font, &self.font_catalog.available);
                 }
-                ElementKind::Shape { size, .. } => {
+                ElementKind::Shape {
+                    shape,
+                    size,
+                    width,
+                    height,
+                } => {
                     ui.label(section_label("SIZE"));
-                    changed |= ui
-                        .add(egui::Slider::new(size, 0.06..=0.68).text("Scale"))
-                        .changed();
+                    let (width_ratio, height_ratio) =
+                        shape_layer_dimensions(*shape, *size, *width, *height);
+                    let mut display_width = width_ratio * 100.0;
+                    let mut display_height = height_ratio * 100.0;
+                    ui.horizontal(|ui| {
+                        ui.label("Width");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut display_width)
+                                    .range(2.0..=200.0)
+                                    .speed(1.0)
+                                    .suffix("%"),
+                            )
+                            .changed();
+                        ui.label("Height");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut display_height)
+                                    .range(2.0..=200.0)
+                                    .speed(1.0)
+                                    .suffix("%"),
+                            )
+                            .changed();
+                    });
+                    if changed {
+                        *width = Some(display_width / 100.0);
+                        *height = Some(display_height / 100.0);
+                    }
+                    ui.label(
+                        RichText::new("Hold Shift while dragging a corner to keep the ratio")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
                 }
                 ElementKind::Image {
                     width,
@@ -1366,7 +1466,7 @@ impl ButtonStudio {
                 .set_file_name("my-button.buttonstudio")
                 .save_file()
         });
-        let Some(mut path) = path else {
+        let Some(path) = path else {
             return;
         };
         self.write_project(path);
@@ -1847,12 +1947,38 @@ fn element_size(kind: &ElementKind) -> f32 {
     }
 }
 
+fn shape_layer_dimensions(
+    shape: ShapeKind,
+    size: f32,
+    width: Option<f32>,
+    height: Option<f32>,
+) -> (f32, f32) {
+    let default_width = size;
+    let default_height = if shape == ShapeKind::Rectangle {
+        size * 2.0 / 3.0
+    } else {
+        default_width
+    };
+    (
+        width.unwrap_or(default_width),
+        height.unwrap_or(default_height),
+    )
+}
+
 fn set_element_size(kind: &mut ElementKind, size: f32) {
     match kind {
         ElementKind::Text { font_size, .. } => *font_size = size.clamp(0.025, 0.2),
         ElementKind::Shape {
-            size: shape_size, ..
-        } => *shape_size = size.clamp(0.06, 0.68),
+            size: shape_size,
+            width,
+            height,
+            shape,
+        } => {
+            *shape_size = size.clamp(0.06, 0.68);
+            let (next_width, next_height) = shape_layer_dimensions(*shape, *shape_size, None, None);
+            *width = Some(next_width);
+            *height = Some(next_height);
+        }
         ElementKind::Image { width, .. } => *width = size.clamp(0.08, IMAGE_WIDTH_LIMIT),
         ElementKind::QrCode { size: qr_size, .. } => *qr_size = size.clamp(0.08, 1.2),
     }

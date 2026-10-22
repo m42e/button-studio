@@ -191,6 +191,12 @@ pub enum ElementKind {
     Shape {
         shape: ShapeKind,
         size: f32,
+        /// Explicit dimensions relative to the artwork diameter. Missing values
+        /// preserve dimensions from projects saved before freeform sizing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<f32>,
     },
     Image {
         asset_id: String,
@@ -279,6 +285,8 @@ impl Default for Design {
                     kind: ElementKind::Shape {
                         shape: ShapeKind::Star,
                         size: 0.28,
+                        width: None,
+                        height: None,
                     },
                 },
                 Element {
@@ -361,7 +369,12 @@ impl Design {
             color: DesignColor::rgb(255, 207, 77),
             opacity: 255,
             visible: true,
-            kind: ElementKind::Shape { shape, size: 0.27 },
+            kind: ElementKind::Shape {
+                shape,
+                size: 0.27,
+                width: None,
+                height: None,
+            },
         });
         id
     }
@@ -510,7 +523,20 @@ impl Design {
                     *font_size = font_size.clamp(0.025, 0.24);
                     *curvature = curvature.clamp(-1.0, 1.0);
                 }
-                ElementKind::Shape { size, .. } => *size = size.clamp(0.05, 0.8),
+                ElementKind::Shape {
+                    size,
+                    width,
+                    height,
+                    ..
+                } => {
+                    *size = size.clamp(0.05, 0.8);
+                    if let Some(width) = width {
+                        *width = width.clamp(0.02, 2.0);
+                    }
+                    if let Some(height) = height {
+                        *height = height.clamp(0.02, 2.0);
+                    }
+                }
                 ElementKind::Image {
                     width,
                     aspect_ratio,
