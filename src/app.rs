@@ -301,6 +301,16 @@ impl ButtonStudio {
                         {
                             self.save_project();
                         }
+                        if ui
+                            .add(
+                                Button::new(icon_text("save", "Save As"))
+                                    .min_size(vec2(100.0, 40.0)),
+                            )
+                            .on_hover_text("Save project to a new file")
+                            .clicked()
+                        {
+                            self.save_project_as();
+                        }
                         if top_icon_button(ui, "folder-open", "Open project", true).clicked() {
                             self.open_project(&context);
                         }
@@ -1359,6 +1369,21 @@ impl ButtonStudio {
         let Some(mut path) = path else {
             return;
         };
+        self.write_project(path);
+    }
+
+    fn save_project_as(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Button Studio project", &["buttonstudio"])
+            .set_file_name("my-button.buttonstudio")
+            .save_file()
+        else {
+            return;
+        };
+        self.write_project(path);
+    }
+
+    fn write_project(&mut self, mut path: PathBuf) {
         if path.extension().is_none() {
             path.set_extension("buttonstudio");
         }
