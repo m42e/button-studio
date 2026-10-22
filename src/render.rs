@@ -489,11 +489,22 @@ fn pdf_sheet_layout(artwork_diameter_mm: f32) -> Vec<[f32; 2]> {
         rows as f32 * artwork_diameter_mm + rows.saturating_sub(1) as f32 * PDF_BUTTON_GAP_MM;
     let left = (A4_WIDTH_MM - grid_width) / 2.0;
     let bottom = (A4_HEIGHT_MM - grid_height) / 2.0;
+    let column_positions = if columns == 2 {
+        [A4_WIDTH_MM * 0.25, A4_WIDTH_MM * 0.75]
+            .map(|center| center - artwork_diameter_mm / 2.0)
+            .to_vec()
+    } else {
+        (0..columns)
+            .map(|column| left + column as f32 * stride)
+            .collect()
+    };
 
     (0..rows)
         .flat_map(|row| {
-            (0..columns)
-                .map(move |column| [left + column as f32 * stride, bottom + row as f32 * stride])
+            column_positions
+                .iter()
+                .copied()
+                .map(move |x| [x, bottom + row as f32 * stride])
         })
         .collect()
 }
