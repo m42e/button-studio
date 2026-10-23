@@ -53,6 +53,11 @@ fn element(id: u64, pos: [f32; 2], color: DesignColor, kind: ElementKind) -> Ele
     }
 }
 pub fn builtin_templates() -> Vec<DesignTemplate> {
+    let mut blank = Design::default();
+    blank.elements.clear();
+    blank.background = DesignColor::WHITE;
+    blank.background_style = crate::model::BackgroundStyle::Solid;
+
     let mut centered = Design::default();
     centered.elements.clear();
     centered.background_style = crate::model::BackgroundStyle::Solid;
@@ -117,10 +122,16 @@ pub fn builtin_templates() -> Vec<DesignTemplate> {
             curvature: 0.0,
         },
     ));
+    blank.normalize_after_load();
     centered.normalize_after_load();
     arc.normalize_after_load();
     name.normalize_after_load();
     vec![
+        DesignTemplate {
+            name: "Blank button".into(),
+            description: "A plain white canvas with no objects to start from scratch.".into(),
+            design: blank,
+        },
         DesignTemplate {
             name: "Centered title + mark".into(),
             description: "A centered headline with a simple logo placeholder.".into(),

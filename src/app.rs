@@ -1,6 +1,6 @@
 use crate::{
     document::SharedDocument,
-    fonts::{AvailableFont, FontCatalog},
+    fonts::{AvailableFont, FontCatalog, FontSlant, FontWeight},
     model::{
         BackgroundStyle, Design, DesignColor, ELEMENT_POSITION_LIMIT, Element, ElementKind,
         History, IMAGE_WIDTH_LIMIT, ImageAsset, ShapeKind, TextFont,
@@ -180,6 +180,11 @@ pub struct ButtonStudio {
     marquee_start: Option<egui::Pos2>,
     font_catalog: FontCatalog,
     font_search: String,
+    font_browser_family: String,
+    font_browser_weight: FontWeight,
+    font_browser_slant: FontSlant,
+    font_preview_key: Option<String>,
+    font_preview_texture: Option<egui::TextureHandle>,
     font_browser_open: bool,
     font_browser_target: Option<u64>,
     focus_font_search: bool,
@@ -252,6 +257,11 @@ impl ButtonStudio {
             marquee_start: None,
             font_catalog,
             font_search: String::new(),
+            font_browser_family: String::new(),
+            font_browser_weight: FontWeight::Regular,
+            font_browser_slant: FontSlant::Normal,
+            font_preview_key: None,
+            font_preview_texture: None,
             font_browser_open: false,
             font_browser_target: None,
             focus_font_search: false,
@@ -452,12 +462,11 @@ impl ButtonStudio {
                                 if ui
                                     .add(
                                         Button::new(
-                                            RichText::new(icon(tool.icon()))
-                                                .size(18.0)
+                                            RichText::new(icon_text(tool.icon(), tool.label()))
                                                 .color(foreground),
                                         )
                                         .fill(fill)
-                                        .min_size(vec2(43.0, 42.0)),
+                                        .min_size(vec2(124.0, 42.0)),
                                     )
                                     .on_hover_text(tool.label())
                                     .clicked()
@@ -1019,6 +1028,13 @@ impl ButtonStudio {
             self.selected = None;
             return;
         };
+        let current_font = self
+            .design
+            .element(id)
+            .and_then(|element| match &element.kind {
+                ElementKind::Text { font, .. } => Some(font.clone()),
+                _ => None,
+            });
 
         ui.label(RichText::new(truncate(&name, 32)).font(display_font(15.0)));
         ui.add_space(4.0);
@@ -1088,12 +1104,8 @@ impl ButtonStudio {
                         .checkbox(transparent_background, "Transparent background")
                         .changed();
                     if !*transparent_background {
-                        let mut background_color: Color32 = (*background).into();
                         ui.label(section_label("QR BACKGROUND"));
-                        if ui.color_edit_button_srgba(&mut background_color).changed() {
-                            *background = background_color.into();
-                            changed = true;
-                        }
+                        changed |= crate::color::edit_design_color(ui, background);
                     }
                 }
             }
@@ -1189,11 +1201,7 @@ impl ButtonStudio {
             if !matches!(element.kind, ElementKind::Image { .. }) {
                 ui.add_space(6.0);
                 ui.label(section_label("COLOR"));
-                let mut color: Color32 = element.color.into();
-                if ui.color_edit_button_srgba(&mut color).changed() {
-                    element.color = color.into();
-                    changed = true;
-                }
+                changed |= crate::color::edit_design_color(ui, &mut element.color);
             }
 
             let mut opacity = element.opacity as f32 / 2.55;
@@ -1300,6 +1308,25 @@ impl ButtonStudio {
             self.font_browser_open = true;
             self.focus_font_search = true;
             self.font_search.clear();
+            let initial_font = current_font
+                .as_ref()
+                .and_then(|current| {
+                    self.font_catalog
+                        .available
+                        .iter()
+                        .find(|candidate| candidate.spec == *current)
+                        .or_else(|| {
+                            self.font_catalog.available.iter().find(|candidate| {
+                                candidate.spec.family.eq_ignore_ascii_case(&current.family)
+                            })
+                        })
+                })
+                .or_else(|| self.font_catalog.available.first());
+            if let Some(font) = initial_font {
+                self.font_browser_family = font.spec.family.clone();
+                self.font_browser_weight = font.weight;
+                self.font_browser_slant = font.slant;
+            }
         }
 
         if changed {
@@ -1332,25 +1359,40 @@ impl ButtonStudio {
             )
             .clicked()
         {
-            self.history.record(self.design.clone());
-            let id = self.design.add_text(self.draft_text.trim().to_owned());
-            if let Some(element) = self.design.element_mut(id)
-                && let ElementKind::Text { curvature, .. } = &mut element.kind
-            {
-                *curvature = self.draft_text_curvature;
-            }
-            self.selected = Some(id);
-            self.tool = Tool::Select;
-            self.set_status("Text layer added", false);
+            let text = self.draft_text.clone();
+            self.add_text_layer(&text);
         }
 
         ui.add_space(12.0);
-        ui.label(section_label("QUICK TEXT"));
+        ui.label(section_label("ADD A QUICK PHRASE"));
+        ui.label(
+            RichText::new("Each phrase creates a new text layer.")
+                .size(11.0)
+                .color(MUTED),
+        );
         for preset in ["HELLO", "TEAM 2026", "I MADE THIS"] {
-            if ui.button(preset).clicked() {
+            if ui.button(icon_text("plus", preset)).clicked() {
                 self.draft_text = preset.to_owned();
+                self.add_text_layer(preset);
             }
         }
+    }
+
+    fn add_text_layer(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.history.record(self.design.clone());
+        let id = self.design.add_text(text.to_owned());
+        if let Some(element) = self.design.element_mut(id)
+            && let ElementKind::Text { curvature, .. } = &mut element.kind
+        {
+            *curvature = self.draft_text_curvature;
+        }
+        self.selected = Some(id);
+        self.tool = Tool::Select;
+        self.set_status("Text layer added", false);
     }
 
     fn shape_controls(&mut self, ui: &mut Ui) {
@@ -1500,6 +1542,12 @@ impl ButtonStudio {
                 );
             }
         });
+        ui.label(
+            RichText::new("SVG imports as one raster image.")
+                .size(10.0)
+                .color(MUTED),
+        )
+        .on_hover_text(crate::svg_import::IMPORT_NOTICE);
     }
 
     fn background_controls(&mut self, ui: &mut Ui, context: &egui::Context) {
@@ -1571,11 +1619,7 @@ impl ButtonStudio {
 
         ui.add_space(12.0);
         ui.label(section_label("COLOR"));
-        let mut color: Color32 = self.design.background.into();
-        if ui.color_edit_button_srgba(&mut color).changed() {
-            self.design.background = color.into();
-            changed = true;
-        }
+        changed |= crate::color::edit_design_color(ui, &mut self.design.background);
         let background_swatches = self
             .saved_palette
             .as_ref()
@@ -1881,7 +1925,7 @@ impl ButtonStudio {
 
     fn import_image(&mut self, context: &egui::Context) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp", "svg"])
             .pick_file()
         else {
             return;
@@ -1917,7 +1961,7 @@ impl ButtonStudio {
 
     fn import_background_image(&mut self, context: &egui::Context) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp", "svg"])
             .pick_file()
         else {
             return;
@@ -2043,15 +2087,8 @@ impl ButtonStudio {
             .and_then(|bytes| Design::from_project_json(&bytes, Some(&path)));
         match result {
             Ok(design) => {
-                let fonts = design_fonts(&design);
-                match self.font_catalog.register_design_fonts(context, &fonts) {
-                    Ok(()) => {
-                        self.pending_project = Some((design, path));
-                        context.request_discard("activate project fonts");
-                        context.request_repaint();
-                    }
-                    Err(error) => self.set_status(error, true),
-                }
+                self.pending_project = Some((design, path));
+                context.request_repaint();
             }
             Err(error) => self.set_status(format!("Could not open project: {error}"), true),
         }
@@ -2141,6 +2178,40 @@ impl ButtonStudio {
         }
     }
 
+    fn refresh_font_preview(&mut self, context: &egui::Context) {
+        let font = font_variant(
+            &self.font_catalog.available,
+            &self.font_browser_family,
+            self.font_browser_weight,
+            self.font_browser_slant,
+        )
+        .map(|font| font.spec.clone());
+        let key = font.as_ref().map(TextFont::registration_key);
+        if self.font_preview_key == key {
+            return;
+        }
+        self.font_preview_key = key.clone();
+        let texture_key = key.unwrap_or_else(|| "unavailable".to_owned());
+        self.font_preview_texture = font.and_then(|font| {
+            let image = crate::text_raster::render_line(
+                "Aa Bb 123 · Quick brown fox",
+                28.0,
+                &font,
+                image::Rgba([29, 31, 36, 255]),
+            )?;
+            let size = [image.width() as usize, image.height() as usize];
+            if size[0] == 0 || size[1] == 0 {
+                return None;
+            }
+            let image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+            Some(context.load_texture(
+                format!("font-preview-{texture_key}"),
+                image,
+                egui::TextureOptions::LINEAR,
+            ))
+        });
+    }
+
     fn font_browser(&mut self, context: &egui::Context) {
         if !self.font_browser_open {
             return;
@@ -2149,18 +2220,18 @@ impl ButtonStudio {
             self.font_browser_open = false;
             return;
         };
-        let Some(current) = self
+        if !self
             .design
             .element(target)
-            .and_then(|element| match &element.kind {
-                ElementKind::Text { font, .. } => Some(font.clone()),
-                _ => None,
-            })
-        else {
+            .is_some_and(|element| matches!(&element.kind, ElementKind::Text { .. }))
+        {
             self.font_browser_open = false;
             self.font_browser_target = None;
             return;
-        };
+        }
+
+        self.refresh_font_preview(context);
+        let preview_texture = self.font_preview_texture.clone();
 
         let available = &self.font_catalog.available;
         let search = &mut self.font_search;
@@ -2168,24 +2239,30 @@ impl ButtonStudio {
         let mut selected = None;
         let mut open = self.font_browser_open;
         let mut close_after_selection = false;
+        let mut selected_family = self.font_browser_family.clone();
+        let mut selected_weight = self.font_browser_weight;
+        let mut selected_slant = self.font_browser_slant;
+        let previous_selection = (selected_family.clone(), selected_weight, selected_slant);
 
         egui::Window::new("Installed fonts")
             .id(egui::Id::new("installed-font-browser"))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_size(vec2(430.0, 520.0))
-            .min_width(340.0)
-            .min_height(360.0)
+            .default_size(vec2(760.0, 560.0))
+            .min_width(620.0)
+            .min_height(460.0)
             .show(context, |ui| {
                 ui.label(
-                    RichText::new("Search every font face installed on this computer.")
-                        .size(12.0)
-                        .color(MUTED),
+                    RichText::new(
+                        "Choose a font family, then set its weight and style independently.",
+                    )
+                    .size(12.0)
+                    .color(MUTED),
                 );
                 let response = ui.add(
                     egui::TextEdit::singleline(search)
-                        .hint_text("Search family, weight, or style")
+                        .hint_text("Search font families, weights, or styles")
                         .desired_width(ui.available_width()),
                 );
                 if *focus_search {
@@ -2193,51 +2270,204 @@ impl ButtonStudio {
                     *focus_search = false;
                 }
 
-                let matches = matching_fonts(available, search);
+                let families = matching_font_families(available, search);
+                let matching_face_count = matching_fonts(available, search).len();
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("{} matching faces", matches.len()))
-                            .size(11.0)
-                            .color(MUTED),
+                        RichText::new(format!(
+                            "{} families · {matching_face_count} matching faces",
+                            families.len()
+                        ))
+                        .size(11.0)
+                        .color(MUTED),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new(format!("{} installed", available.len()))
-                                .size(11.0)
-                                .color(MUTED),
+                            RichText::new(format!(
+                                "{} families · {} faces installed",
+                                matching_font_families(available, "").len(),
+                                available.len()
+                            ))
+                            .size(11.0)
+                            .color(MUTED),
                         );
                     });
                 });
                 ui.separator();
 
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show_rows(ui, 30.0, matches.len(), |ui, range| {
-                        for font in &matches[range] {
-                            if ui
-                                .selectable_label(font.spec == current, &font.label)
-                                .clicked()
-                            {
+                ui.horizontal(|ui| {
+                    let family_width = (ui.available_width() * 0.4).clamp(220.0, 290.0);
+                    const FAMILY_LIST_HEIGHT: f32 = 320.0;
+                    ui.allocate_ui(vec2(family_width, FAMILY_LIST_HEIGHT), |ui| {
+                        ui.vertical(|ui| {
+                            ui.label(section_label("FONT FAMILIES"));
+                            ui.add_space(4.0);
+                            if families.is_empty() {
+                                ui.label(RichText::new("No matching font families.").color(MUTED));
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("font-family-list")
+                                    .min_scrolled_height(220.0)
+                                    .max_height(FAMILY_LIST_HEIGHT - 28.0)
+                                    .scroll_bar_visibility(
+                                        egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                                    )
+                                    .show(ui, |ui| {
+                                        for family in &families {
+                                            let face_count = available
+                                                .iter()
+                                                .filter(|font| {
+                                                    font.spec.family.eq_ignore_ascii_case(family)
+                                                })
+                                                .count();
+                                            let label = format!(
+                                                "{}  ·  {face_count}",
+                                                truncate(family, 26)
+                                            );
+                                            if ui
+                                                .selectable_label(
+                                                    selected_family.eq_ignore_ascii_case(family),
+                                                    label,
+                                                )
+                                                .clicked()
+                                            {
+                                                selected_family = family.clone();
+                                                if let Some(font) = preferred_font_variant(
+                                                    available,
+                                                    &selected_family,
+                                                ) {
+                                                    selected_weight = font.weight;
+                                                    selected_slant = font.slant;
+                                                }
+                                            }
+                                        }
+                                    });
+                            }
+                        });
+                    });
+
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.label(section_label("FONT STYLE"));
+                        ui.add_space(4.0);
+
+                        let weight_options =
+                            font_weights_for_family(available, &selected_family, selected_slant);
+                        let previous_weight = selected_weight;
+                        ui.horizontal(|ui| {
+                            ui.label("Weight");
+                            egui::ComboBox::from_id_salt("font_weight")
+                                .selected_text(selected_weight.label())
+                                .width(148.0)
+                                .show_ui(ui, |ui| {
+                                    for weight in &weight_options {
+                                        ui.selectable_value(
+                                            &mut selected_weight,
+                                            *weight,
+                                            weight.label(),
+                                        );
+                                    }
+                                });
+                        });
+                        if previous_weight != selected_weight {
+                            let slant_options = font_slants_for_family(
+                                available,
+                                &selected_family,
+                                selected_weight,
+                            );
+                            if !slant_options.contains(&selected_slant) {
+                                selected_slant = preferred_slant(&slant_options);
+                            }
+                        }
+
+                        let slant_options =
+                            font_slants_for_family(available, &selected_family, selected_weight);
+                        ui.horizontal(|ui| {
+                            ui.label("Style");
+                            egui::ComboBox::from_id_salt("font_slant")
+                                .selected_text(selected_slant.label())
+                                .width(148.0)
+                                .show_ui(ui, |ui| {
+                                    for slant in &slant_options {
+                                        ui.selectable_value(
+                                            &mut selected_slant,
+                                            *slant,
+                                            slant.label(),
+                                        );
+                                    }
+                                });
+                        });
+
+                        let chosen_variant = font_variant(
+                            available,
+                            &selected_family,
+                            selected_weight,
+                            selected_slant,
+                        );
+                        ui.add_space(10.0);
+                        ui.label(section_label("PREVIEW"));
+                        Frame::new()
+                            .fill(Color32::from_rgb(250, 249, 246))
+                            .stroke(Stroke::new(1.0, Color32::from_gray(220)))
+                            .inner_margin(egui::Margin::same(12))
+                            .corner_radius(5.0)
+                            .show(ui, |ui| {
+                                if let Some(texture) = &preview_texture {
+                                    let size = texture.size_vec2();
+                                    let scale = (ui.available_width() / size.x).min(1.0);
+                                    ui.add(egui::Image::new((texture.id(), size * scale)));
+                                } else {
+                                    ui.label(
+                                        RichText::new("Preview unavailable for this face.")
+                                            .color(MUTED),
+                                    );
+                                }
+                            });
+                        if let Some(font) = chosen_variant {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {} · {}",
+                                    font.spec.family,
+                                    font.weight.label(),
+                                    font.slant.label()
+                                ))
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                            if ui.button(icon_text("check", "Use this font")).clicked() {
                                 selected = Some(font.spec.clone());
                                 close_after_selection = true;
                             }
+                        } else {
+                            ui.label(
+                                RichText::new("No face has this style combination.").color(MUTED),
+                            );
                         }
                     });
+                });
             });
 
+        let selection = (selected_family, selected_weight, selected_slant);
+        if selection
+            != (
+                previous_selection.0.clone(),
+                previous_selection.1,
+                previous_selection.2,
+            )
+        {
+            self.font_browser_family = selection.0;
+            self.font_browser_weight = selection.1;
+            self.font_browser_slant = selection.2;
+            self.refresh_font_preview(context);
+            context.request_repaint();
+        }
         self.font_browser_open = open && !close_after_selection;
         if !self.font_browser_open {
             self.font_browser_target = None;
         }
         if let Some(font) = selected {
-            match self.font_catalog.ensure_registered(context, &font) {
-                Ok(()) => {
-                    self.pending_font_change = Some((target, font));
-                    context.request_discard("activate selected system font");
-                    context.request_repaint();
-                }
-                Err(error) => self.set_status(error, true),
-            }
+            self.pending_font_change = Some((target, font));
+            context.request_repaint();
         }
     }
 
@@ -2796,26 +3026,11 @@ impl ButtonStudio {
     }
 
     fn queue_design_update(&mut self, context: &egui::Context, design: Design) {
-        match self
-            .font_catalog
-            .register_design_fonts(context, &design_fonts(&design))
-        {
-            Ok(()) => {
-                self.pending_library_update = Some(PendingLibraryUpdate::Design(design));
-                context.request_discard("activate template fonts");
-                context.request_repaint();
-            }
-            Err(error) => self.set_status(error, true),
-        }
+        self.pending_library_update = Some(PendingLibraryUpdate::Design(design));
+        context.request_repaint();
     }
 
     fn queue_style_update(&mut self, context: &egui::Context, style: SavedStyle) {
-        if let Some(font) = &style.font
-            && let Err(error) = self.font_catalog.ensure_registered(context, font)
-        {
-            self.set_status(error, true);
-            return;
-        }
         self.pending_library_update = Some(PendingLibraryUpdate::Style(
             style,
             self.selected_ids.clone(),
@@ -2833,36 +3048,55 @@ impl ButtonStudio {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
+            .default_width(560.0)
             .show(context, |ui| {
+                ui.set_min_width(520.0);
                 egui::Grid::new("shortcut-grid")
                     .num_columns(2)
-                    .spacing(vec2(22.0, 6.0))
+                    .spacing(vec2(16.0, 7.0))
                     .show(ui, |ui| {
+                        ui.label(section_label("SHORTCUT"));
+                        ui.label(section_label("ACTION"));
+                        ui.end_row();
                         for (shortcut, action) in [
-                            ("T", "Add text"),
-                            ("S", "Add shape"),
+                            ("T", "Choose Text tool"),
+                            ("S", "Choose Shapes tool"),
                             ("I", "Import image"),
-                            ("Cmd/Ctrl+D", "Duplicate selection"),
-                            ("Cmd/Ctrl+C / V", "Copy / paste objects"),
-                            ("Cmd/Ctrl+Shift+V", "Paste style"),
-                            ("Cmd/Ctrl+G / Shift+G", "Group / ungroup"),
+                            ("Cmd/Ctrl+S", "Save project"),
+                            ("Cmd/Ctrl+O", "Open project"),
                             ("Cmd/Ctrl+E", "Export and review"),
+                            ("Cmd/Ctrl+D", "Duplicate selection"),
+                            ("Cmd/Ctrl+C", "Copy objects"),
+                            ("Cmd/Ctrl+V", "Paste objects"),
+                            ("Cmd/Ctrl+Shift+V", "Paste style"),
+                            ("Cmd/Ctrl+G", "Group selection"),
+                            ("Cmd/Ctrl+Shift+G", "Ungroup selection"),
                             (
                                 "Cmd/Ctrl+PageUp / PageDown",
                                 "Bring to front / send to back",
                             ),
                             ("Arrow keys", "Nudge selection"),
                             ("Shift + arrows", "Larger nudge"),
-                            ("Cmd/Ctrl+Z / Shift+Z", "Undo / redo"),
+                            ("Delete / Backspace", "Delete selection"),
+                            ("Cmd/Ctrl+Z", "Undo"),
+                            ("Cmd+Shift+Z / Ctrl+Y", "Redo"),
                         ] {
-                            ui.label(RichText::new(shortcut).strong());
+                            Frame::new()
+                                .fill(Color32::from_rgb(239, 238, 233))
+                                .inner_margin(egui::Margin::symmetric(6, 3))
+                                .corner_radius(4.0)
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(shortcut).monospace().strong().color(INK),
+                                    );
+                                });
                             ui.label(action);
                             ui.end_row();
                         }
                     });
                 ui.label(
                     RichText::new(
-                        "Shortcuts pause while a text field or other keyboard editor has focus.",
+                        "Canvas shortcuts pause while a text field or keyboard editor has focus. Save and Open remain available.",
                     )
                     .size(11.0)
                     .color(MUTED),
@@ -3308,23 +3542,103 @@ fn font_picker_button(ui: &mut Ui, current: &TextFont, available: &[AvailableFon
     .clicked()
 }
 
-fn design_fonts(design: &Design) -> Vec<TextFont> {
-    design
-        .elements
-        .iter()
-        .filter_map(|element| match &element.kind {
-            ElementKind::Text { font, .. } => Some(font.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
 fn matching_fonts<'a>(available: &'a [AvailableFont], search: &str) -> Vec<&'a AvailableFont> {
     let query = search.trim().to_lowercase();
     available
         .iter()
         .filter(|font| query.is_empty() || font.label.to_lowercase().contains(&query))
         .collect()
+}
+
+fn matching_font_families(available: &[AvailableFont], search: &str) -> Vec<String> {
+    let query = search.trim().to_lowercase();
+    let mut families = available
+        .iter()
+        .filter(|font| query.is_empty() || font.label.to_lowercase().contains(&query))
+        .map(|font| font.spec.family.clone())
+        .collect::<Vec<_>>();
+    families.sort_by_key(|family| family.to_lowercase());
+    families.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    families
+}
+
+fn font_weights_for_family(
+    available: &[AvailableFont],
+    family: &str,
+    slant: FontSlant,
+) -> Vec<FontWeight> {
+    let mut weights = available
+        .iter()
+        .filter(|font| font.spec.family.eq_ignore_ascii_case(family) && font.slant == slant)
+        .map(|font| font.weight)
+        .collect::<Vec<_>>();
+    weights.sort();
+    weights.dedup();
+    weights
+}
+
+fn font_slants_for_family(
+    available: &[AvailableFont],
+    family: &str,
+    weight: FontWeight,
+) -> Vec<FontSlant> {
+    let mut slants = available
+        .iter()
+        .filter(|font| font.spec.family.eq_ignore_ascii_case(family) && font.weight == weight)
+        .map(|font| font.slant)
+        .collect::<Vec<_>>();
+    slants.sort();
+    slants.dedup();
+    slants
+}
+
+fn preferred_slant(options: &[FontSlant]) -> FontSlant {
+    if options.contains(&FontSlant::Normal) {
+        FontSlant::Normal
+    } else {
+        options.first().copied().unwrap_or(FontSlant::Normal)
+    }
+}
+
+fn font_variant<'a>(
+    available: &'a [AvailableFont],
+    family: &str,
+    weight: FontWeight,
+    slant: FontSlant,
+) -> Option<&'a AvailableFont> {
+    available.iter().find(|font| {
+        font.spec.family.eq_ignore_ascii_case(family)
+            && font.weight == weight
+            && font.slant == slant
+    })
+}
+
+fn preferred_font_variant<'a>(
+    available: &'a [AvailableFont],
+    family: &str,
+) -> Option<&'a AvailableFont> {
+    available
+        .iter()
+        .find(|font| {
+            font.spec.family.eq_ignore_ascii_case(family)
+                && font.weight == FontWeight::Regular
+                && font.slant == FontSlant::Normal
+        })
+        .or_else(|| {
+            available.iter().find(|font| {
+                font.spec.family.eq_ignore_ascii_case(family) && font.slant == FontSlant::Normal
+            })
+        })
+        .or_else(|| {
+            available.iter().find(|font| {
+                font.spec.family.eq_ignore_ascii_case(family) && font.weight == FontWeight::Regular
+            })
+        })
+        .or_else(|| {
+            available
+                .iter()
+                .find(|font| font.spec.family.eq_ignore_ascii_case(family))
+        })
 }
 
 fn text_arc_controls(ui: &mut Ui, curvature: &mut f32) -> bool {
@@ -3671,10 +3985,14 @@ mod tests {
             AvailableFont {
                 label: "Avenir Next · Bold Italic".to_owned(),
                 spec: TextFont::default(),
+                weight: FontWeight::Bold,
+                slant: FontSlant::Italic,
             },
             AvailableFont {
                 label: "Courier · Regular".to_owned(),
                 spec: TextFont::default(),
+                weight: FontWeight::Regular,
+                slant: FontSlant::Normal,
             },
         ];
 

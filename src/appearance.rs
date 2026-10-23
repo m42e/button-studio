@@ -84,7 +84,7 @@ pub fn controls(
     element: &mut crate::model::Element,
     artwork_mm: f32,
 ) -> bool {
-    use eframe::egui::{Color32, ComboBox, Slider};
+    use eframe::egui::{ComboBox, Slider};
     let mut changed = false;
     let body = eframe::egui::CollapsingHeader::new("Appearance")
         .default_open(false)
@@ -102,11 +102,7 @@ pub fn controls(
             }
             if outlined {
                 if let Some(color) = &mut appearance.outline {
-                    let mut ui_color = Color32::from(*color);
-                    if ui.color_edit_button_srgba(&mut ui_color).changed() {
-                        *color = DesignColor::from(ui_color);
-                        changed = true;
-                    }
+                    changed |= crate::color::edit_design_color(ui, color);
                 }
                 let mut outline_mm = appearance.outline_width * artwork_mm;
                 if ui

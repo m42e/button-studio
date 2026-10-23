@@ -1,18 +1,84 @@
-use crate::{model::TextFont, theme};
-use eframe::egui::{self, FontData, FontFamily};
+use crate::model::TextFont;
 use fontdb::{Source, Style, Weight};
-use std::{collections::HashSet, sync::Arc};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FontWeight {
+    Thin,
+    ExtraLight,
+    Light,
+    Regular,
+    Medium,
+    SemiBold,
+    Bold,
+    ExtraBold,
+    Black,
+}
+
+impl FontWeight {
+    pub fn from_weight(weight: Weight) -> Self {
+        match weight.0 {
+            0..=149 => Self::Thin,
+            150..=249 => Self::ExtraLight,
+            250..=349 => Self::Light,
+            350..=449 => Self::Regular,
+            450..=549 => Self::Medium,
+            550..=649 => Self::SemiBold,
+            650..=749 => Self::Bold,
+            750..=849 => Self::ExtraBold,
+            _ => Self::Black,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Thin => "Thin",
+            Self::ExtraLight => "Extra Light",
+            Self::Light => "Light",
+            Self::Regular => "Regular",
+            Self::Medium => "Medium",
+            Self::SemiBold => "Semibold",
+            Self::Bold => "Bold",
+            Self::ExtraBold => "Extra Bold",
+            Self::Black => "Black",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FontSlant {
+    Normal,
+    Italic,
+    Oblique,
+}
+
+impl FontSlant {
+    pub fn from_style(style: Style) -> Self {
+        match style {
+            Style::Normal => Self::Normal,
+            Style::Italic => Self::Italic,
+            Style::Oblique => Self::Oblique,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Regular",
+            Self::Italic => "Italic",
+            Self::Oblique => "Oblique",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AvailableFont {
     pub label: String,
     pub spec: TextFont,
+    pub weight: FontWeight,
+    pub slant: FontSlant,
 }
 
 pub struct FontCatalog {
     pub available: Vec<AvailableFont>,
-    definitions: egui::FontDefinitions,
-    registered: HashSet<String>,
 }
 
 impl FontCatalog {
@@ -23,6 +89,8 @@ impl FontCatalog {
         let mut available = vec![AvailableFont {
             label: "Archivo Black (bundled)".to_owned(),
             spec: TextFont::default(),
+            weight: FontWeight::Black,
+            slant: FontSlant::Normal,
         }];
         for face in database.faces() {
             let path = match &face.source {
@@ -34,14 +102,18 @@ impl FontCatalog {
                 .first()
                 .map(|(name, _)| name.clone())
                 .unwrap_or_else(|| face.post_script_name.clone());
+            let weight = FontWeight::from_weight(face.weight);
+            let slant = FontSlant::from_style(face.style);
             available.push(AvailableFont {
-                label: face_label(&family, face.weight, face.style),
+                label: face_label(&family, weight, slant),
                 spec: TextFont {
                     family,
                     face: face.post_script_name.clone(),
                     path: Some(path),
                     index: face.index,
                 },
+                weight,
+                slant,
             });
         }
 
@@ -50,80 +122,16 @@ impl FontCatalog {
             left.spec.path == right.spec.path && left.spec.index == right.spec.index
         });
 
-        Self {
-            available,
-            definitions: theme::base_font_definitions(),
-            registered: HashSet::from([TextFont::default().registration_key()]),
-        }
-    }
-
-    pub fn ensure_registered(
-        &mut self,
-        context: &egui::Context,
-        font: &TextFont,
-    ) -> Result<(), String> {
-        let key = font.registration_key();
-        if self.registered.contains(&key) {
-            return Ok(());
-        }
-        let path = font
-            .path
-            .as_ref()
-            .ok_or_else(|| format!("Font file for {} is unavailable", font.family))?;
-        let bytes = std::fs::read(path)
-            .map_err(|error| format!("Could not load font {}: {error}", font.family))?;
-        let mut data = FontData::from_owned(bytes);
-        data.index = font.index;
-        self.definitions
-            .font_data
-            .insert(key.clone(), Arc::new(data));
-
-        let mut fallbacks = self
-            .definitions
-            .families
-            .get(&FontFamily::Proportional)
-            .cloned()
-            .unwrap_or_default();
-        fallbacks.retain(|fallback| fallback != &key);
-        fallbacks.insert(0, key.clone());
-        self.definitions
-            .families
-            .insert(FontFamily::Name(Arc::from(key.as_str())), fallbacks);
-        self.registered.insert(key);
-        context.set_fonts(self.definitions.clone());
-        Ok(())
-    }
-
-    pub fn register_design_fonts(
-        &mut self,
-        context: &egui::Context,
-        fonts: &[TextFont],
-    ) -> Result<(), String> {
-        for font in fonts {
-            self.ensure_registered(context, font)?;
-        }
-        Ok(())
+        Self { available }
     }
 }
 
-fn face_label(family: &str, weight: Weight, style: Style) -> String {
-    let weight = match weight.0 {
-        0..=149 => "Thin",
-        150..=249 => "Extra Light",
-        250..=349 => "Light",
-        350..=449 => "Regular",
-        450..=549 => "Medium",
-        550..=649 => "Semibold",
-        650..=749 => "Bold",
-        750..=849 => "Extra Bold",
-        _ => "Black",
-    };
-    let style = match style {
-        Style::Normal => "",
-        Style::Italic => " Italic",
-        Style::Oblique => " Oblique",
-    };
-    format!("{family} · {weight}{style}")
+fn face_label(family: &str, weight: FontWeight, slant: FontSlant) -> String {
+    if slant == FontSlant::Normal {
+        format!("{family} · {}", weight.label())
+    } else {
+        format!("{family} · {} {}", weight.label(), slant.label())
+    }
 }
 
 #[cfg(test)]
@@ -143,32 +151,17 @@ mod tests {
     }
 
     #[test]
-    fn discovered_system_face_can_be_registered_with_egui() {
-        let context = egui::Context::default();
-        let mut catalog = FontCatalog::discover();
+    fn discovered_system_face_has_weight_and_style_metadata() {
+        let catalog = FontCatalog::discover();
         let Some(font) = catalog
             .available
             .iter()
             .find(|font| font.spec.path.is_some())
-            .map(|font| font.spec.clone())
         else {
             return;
         };
-
-        catalog
-            .ensure_registered(&context, &font)
-            .expect("register installed font");
-        let key = font.registration_key();
-        let _ = context.run_ui(Default::default(), |ui| {
-            let galley = ui.painter().layout_no_wrap(
-                "Installed font".to_owned(),
-                egui::FontId::new(18.0, egui::FontFamily::Name(Arc::from(key.as_str()))),
-                egui::Color32::WHITE,
-            );
-            assert!(galley.size().x > 0.0);
-        });
-
-        assert!(catalog.registered.contains(&font.registration_key()));
+        assert!(!font.spec.family.is_empty());
+        assert!(!font.label.is_empty());
     }
 
     #[test]

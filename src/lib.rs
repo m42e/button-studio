@@ -1,5 +1,6 @@
 pub mod app;
 pub mod appearance;
+pub(crate) mod color;
 pub mod document;
 pub mod editor;
 pub mod fonts;

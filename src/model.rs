@@ -77,11 +77,12 @@ impl From<DesignColor> for Color32 {
 
 impl From<Color32> for DesignColor {
     fn from(color: Color32) -> Self {
+        let [red, green, blue, alpha] = color.to_srgba_unmultiplied();
         Self {
-            red: color.r(),
-            green: color.g(),
-            blue: color.b(),
-            alpha: color.a(),
+            red,
+            green,
+            blue,
+            alpha,
         }
     }
 }
@@ -326,7 +327,7 @@ impl Default for Design {
                     visible: true,
                     kind: ElementKind::Text {
                         text: "MAKE IT YOURS".to_owned(),
-                        font_size: 0.095,
+                        font_size: 0.075,
                         font: TextFont::default(),
                         curvature: 0.0,
                     },
@@ -449,6 +450,15 @@ impl Design {
     pub fn import_asset_path(&mut self, path: &Path) -> Result<(String, f32), String> {
         let data = fs::read(path)
             .map_err(|error| format!("Could not read image {}: {error}", path.display()))?;
+        let data = if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+        {
+            crate::svg_import::rasterize_svg(&data)?
+        } else {
+            data
+        };
         self.import_asset(data, Some(path.to_owned()))
     }
 
