@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ gitea.ref }}
+          ref: ${{ github.ref }}
 
       - name: Check tag matches Cargo package version
         shell: bash
@@ -42,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ gitea.ref }}
+          ref: ${{ github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -99,7 +99,7 @@ jobs:
         run: |
           mkdir -p package
           ditto -c -k --sequesterRsrc --keepParent \
-            "target/macos/Pincraft Button Studio.app" \
+            "target/macos/Button Designer.app" \
             "package/button-studio-${GITHUB_REF_NAME}-macos.zip"
 
       - uses: actions/upload-artifact@v4
@@ -110,6 +110,7 @@ jobs:
 
   publish:
     needs: build
+    if: ${{ github.server_url != 'https://github.com' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -123,9 +124,9 @@ jobs:
       - name: Publish release assets
         uses: akkuman/gitea-release-action@v1
         with:
-          server_url: ${{ gitea.server_url }}
+          server_url: ${{ github.server_url }}
           token: ${{ secrets.GITEA_TOKEN }}
-          tag_name: ${{ gitea.ref_name }}
-          name: ${{ gitea.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           files: |-
             dist/*

@@ -37,7 +37,7 @@ fn project_path_from_args(arguments: impl IntoIterator<Item = String>) -> Option
 }
 
 fn run_gui(document: SharedDocument, project_path: Option<PathBuf>) -> eframe::Result {
-    let (project_sender, project_receiver) = mpsc::channel();
+    let (_project_sender, project_receiver) = mpsc::channel();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Button Designer")
@@ -53,7 +53,7 @@ fn run_gui(document: SharedDocument, project_path: Option<PathBuf>) -> eframe::R
             let mut app =
                 ButtonStudio::with_document_and_project_paths(context, document, project_receiver);
             #[cfg(target_os = "macos")]
-            macos::install_open_document_handler(project_sender, context.egui_ctx.clone());
+            macos::install_open_document_handler(_project_sender, context.egui_ctx.clone());
             if let Some(path) = project_path {
                 app.open_project_path(&context.egui_ctx, path);
             }
