@@ -40,14 +40,14 @@ fn run_gui(document: SharedDocument, project_path: Option<PathBuf>) -> eframe::R
     let (project_sender, project_receiver) = mpsc::channel();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Pincraft Button Studio")
+            .with_title("Button Designer")
             .with_inner_size([1_440.0, 900.0])
             .with_min_inner_size([1_120.0, 720.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Pincraft Button Studio",
+        "Button Designer",
         options,
         Box::new(move |context| {
             let mut app =

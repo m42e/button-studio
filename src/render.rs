@@ -427,7 +427,7 @@ pub fn render_project_preview_png(design: &Design, output_size: u32) -> Result<V
 pub fn export_pdf_sheet(design: &Design, path: &Path) -> Result<usize, String> {
     let output_size = export_pixel_size(design);
     let output = render_trimmed_badge(design, output_size, EXPORT_SUPERSAMPLE)?;
-    let mut document = PdfDocument::new("Button Studio print sheet");
+    let mut document = PdfDocument::new("Button Designer print sheet");
     let image_id = document.add_image(&RawImage {
         pixels: RawImageData::U8(output.into_raw()),
         width: output_size as usize,
@@ -480,7 +480,7 @@ pub fn export_pdf_series(
     let output_size = export_pixel_size(design);
     let unrounded_pixels = design.artwork_diameter_mm() / 25.4 * EXPORT_DPI;
     let pixel_rounding_scale = unrounded_pixels / output_size as f32;
-    let mut document = PdfDocument::new("Button Studio series print");
+    let mut document = PdfDocument::new("Button Designer series print");
     let mut pages = Vec::new();
     for page_rows in rows.chunks(layout.len()) {
         let mut operations = Vec::with_capacity(page_rows.len());

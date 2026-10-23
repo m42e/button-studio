@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-app="$root/target/macos/Pincraft Button Studio.app"
+app="$root/target/macos/Button Designer.app"
 products="$root/target/xcode/Release"
 sign_identity=${CODE_SIGN_IDENTITY:--}
 sign_options=(--force --sign "$sign_identity" --options runtime)

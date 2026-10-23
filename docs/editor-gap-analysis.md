@@ -1,12 +1,12 @@
-# Button Studio editing capabilities: gap analysis
+# Button Designer editing capabilities: gap analysis
 
-**Scope:** assess the current Button Studio editor against the editing behaviors users learn from mature 2D design tools such as Inkscape, then define a practical future baseline for button artwork. This is a product planning document, not a proposal to reproduce Inkscape.
+**Scope:** assess the current Button Designer editor against the editing behaviors users learn from mature 2D design tools such as Inkscape, then define a practical future baseline for button artwork. This is a product planning document, not a proposal to reproduce Inkscape.
 
 The analysis below records the baseline before implementation. See the implementation status at the end for the capabilities now available. Canvas navigation is excluded from this roadmap.
 
 ## Executive summary
 
-Button Studio already covers the main object types and the production path: users can create and position text, preset shapes, images, QR codes, and backgrounds, organize layers, undo/redo, and export print-ready artwork. The editor is already useful for straightforward single-button designs.
+Button Designer already covers the main object types and the production path: users can create and position text, preset shapes, images, QR codes, and backgrounds, organize layers, undo/redo, and export print-ready artwork. The editor is already useful for straightforward single-button designs.
 
 The largest usability gap is the precision and composition loop around those objects. A user can drag and resize, but has limited ways to make exact adjustments, select and arrange several objects together, or align objects by snapping. Styling is also mostly flat color and opacity. These gaps become more visible as a design becomes crowded or needs to match a reference closely.
 
@@ -89,7 +89,7 @@ For each release, validate with short user tasks rather than feature counts: mak
 
 ## Reference point: Inkscape
 
-Inkscape is useful here as a vocabulary for mature editing patterns: a selector plus multi-object transform and alignment/distribution tools; layers and grouping; snapping and guides; flexible fills/strokes; richer text spacing and alignment; and optional path editing. Those patterns informed the gaps above. Its broad illustration toolset (node editing, arbitrary Bezier paths, tracing, filters, extensions, and complex gradients) is not a requirement for Button Studio's baseline.
+Inkscape is useful here as a vocabulary for mature editing patterns: a selector plus multi-object transform and alignment/distribution tools; layers and grouping; snapping and guides; flexible fills/strokes; richer text spacing and alignment; and optional path editing. Those patterns informed the gaps above. Its broad illustration toolset (node editing, arbitrary Bezier paths, tracing, filters, extensions, and complex gradients) is not a requirement for Button Designer's baseline.
 
 References:
 

@@ -338,12 +338,12 @@ impl ButtonStudio {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new("PINCRAFT")
+                            RichText::new("BUTTON")
                                 .font(display_font(20.0))
                                 .color(Color32::WHITE),
                         );
                         ui.label(
-                            RichText::new("BUTTON STUDIO")
+                            RichText::new("DESIGNER")
                                 .size(10.0)
                                 .strong()
                                 .color(Color32::from_gray(164)),
@@ -2048,7 +2048,7 @@ impl ButtonStudio {
     fn save_project(&mut self) {
         let path = self.project_path.clone().or_else(|| {
             rfd::FileDialog::new()
-                .add_filter("Button Studio project", &["buttonstudio"])
+                .add_filter("Button Designer project", &["buttonstudio"])
                 .set_file_name("my-button.buttonstudio")
                 .save_file()
         });
@@ -2060,7 +2060,7 @@ impl ButtonStudio {
 
     fn save_project_as(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Button Studio project", &["buttonstudio"])
+            .add_filter("Button Designer project", &["buttonstudio"])
             .set_file_name("my-button.buttonstudio")
             .save_file()
         else {
@@ -2102,7 +2102,7 @@ impl ButtonStudio {
 
     fn open_project(&mut self, context: &egui::Context) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Button Studio project", &["buttonstudio", "json"])
+            .add_filter("Button Designer project", &["buttonstudio", "json"])
             .pick_file()
         else {
             return;
@@ -2945,13 +2945,13 @@ impl ButtonStudio {
                 }
                 LibraryAction::SaveTemplate => {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Button Studio template", &["buttontemplate", "json"])
+                        .add_filter("Button Designer template", &["buttontemplate", "json"])
                         .set_file_name(format!("{}.buttontemplate", safe_file_stem(&template_name)))
                         .save_file()
                     {
                         let template = DesignTemplate {
                             name: template_name.clone(),
-                            description: "User-saved Button Studio layout".into(),
+                            description: "User-saved Button Designer layout".into(),
                             design: self.design.clone(),
                         };
                         match templates::save_template(&path, &template) {
@@ -2962,7 +2962,7 @@ impl ButtonStudio {
                 }
                 LibraryAction::LoadTemplate => {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Button Studio template", &["buttontemplate", "json"])
+                        .add_filter("Button Designer template", &["buttontemplate", "json"])
                         .pick_file()
                     {
                         match templates::load_template(&path) {

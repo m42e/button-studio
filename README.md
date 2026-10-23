@@ -1,4 +1,4 @@
-# Pincraft Button Studio
+# Button Designer
 
 A native, cross-platform button designer built in Rust with `eframe` / `egui`.
 It keeps the direct canvas workflow of the referenced web editor while using a
@@ -132,7 +132,7 @@ for the `ubuntu-latest`, `windows-latest`, and `macos-latest` labels.
 | Delete layer | `Delete` or `Backspace` |
 
 Object shortcuts apply when a text field does not have keyboard focus. The object
-clipboard works inside Button Studio; text fields retain their normal system
+clipboard works inside Button Designer; text fields retain their normal system
 clipboard behavior.
 
 Open **Library** for built-in layouts and reusable templates, palettes, and styles.
@@ -157,7 +157,7 @@ when loading, so projects remain backward compatible and other platforms can
 continue treating them as JSON. Older projects gain a preview the next time they
 are saved.
 
-Version 7 and older path-based projects remain supported. Button Studio reads
+Version 7 and older path-based projects remain supported. Button Designer reads
 each linked image when opening a legacy project, migrates it to the embedded
 asset table in memory, and writes the self-contained format on the next save.
 Missing legacy images are reported with their path. New-format projects never
@@ -188,7 +188,7 @@ preview extensions in addition to the embedded PNG. Build the app bundle with:
 scripts/build-macos-app.sh
 ```
 
-The result is `target/macos/Pincraft Button Studio.app`. The script uses ad-hoc
+The result is `target/macos/Button Designer.app`. The script uses ad-hoc
 signing by default for build verification. For an installable or distributable
 build, pass one signing identity for the host and both extensions:
 

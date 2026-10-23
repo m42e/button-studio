@@ -10,9 +10,9 @@ enum ProjectPreviewError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidProject:
-            return "The Button Studio project is invalid."
+            return "The Button Designer project is invalid."
         case .missingPreview:
-            return "This project does not contain a preview. Open and save it in Button Studio to add one."
+            return "This project does not contain a preview. Open and save it in Button Designer to add one."
         case .invalidPreview:
             return "The embedded project preview is invalid."
         }
