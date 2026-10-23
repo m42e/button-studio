@@ -108,10 +108,12 @@ git push origin main --follow-tags
 
 The release script updates the crate and lockfile versions, commits the change,
 and creates the matching `vMAJOR.MINOR.PATCH` tag. Pushing that commit and tag
-builds macOS, Windows, and Linux release archives and publishes them to the
-repository release. The macOS app archive uses the ad-hoc signing configured by
-the app bundle script. Gitea Actions must be enabled, with runners registered
-for the `ubuntu-latest`, `windows-latest`, and `macos-latest` labels.
+builds macOS, Windows, and Linux release archives. On GitHub, the workflow
+uploads all three archives to a GitHub Release whose title matches the tag and
+generates release notes. On Gitea, it publishes them to the matching Gitea
+release. The macOS app archive uses the ad-hoc signing configured by the app
+bundle script. Gitea Actions must be enabled, with runners registered for the
+`ubuntu-latest`, `windows-latest`, and `macos-latest` labels.
 
 ## Shortcuts
 

@@ -10,9 +10,15 @@ permissions:
 
 jobs:
   verify-version:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     steps:
+      - uses: actions/checkout@v7
+        if: ${{ github.server_url == 'https://github.com' }}
+        with:
+          ref: ${{ github.ref }}
+
       - uses: actions/checkout@v4
+        if: ${{ github.server_url != 'https://github.com' }}
         with:
           ref: ${{ github.ref }}
 
@@ -33,14 +39,23 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            github_os: ubuntu-24.04
             artifact: linux
           - os: windows-latest
+            github_os: windows-latest
             artifact: windows
           - os: macos-latest
+            github_os: macos-latest
             artifact: macos
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ github.server_url == 'https://github.com' && matrix.github_os || matrix.os }}
     steps:
+      - uses: actions/checkout@v7
+        if: ${{ github.server_url == 'https://github.com' }}
+        with:
+          ref: ${{ github.ref }}
+
       - uses: actions/checkout@v4
+        if: ${{ github.server_url != 'https://github.com' }}
         with:
           ref: ${{ github.ref }}
 
@@ -102,13 +117,43 @@ jobs:
             "target/macos/Button Designer.app" \
             "package/button-studio-${GITHUB_REF_NAME}-macos.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
+        if: ${{ github.server_url == 'https://github.com' }}
         with:
           name: release-${{ matrix.artifact }}
           path: package/*
           if-no-files-found: error
 
-  publish:
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.server_url != 'https://github.com' }}
+        with:
+          name: release-${{ matrix.artifact }}
+          path: package/*
+          if-no-files-found: error
+
+  publish-github:
+    needs: build
+    if: ${{ github.server_url == 'https://github.com' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*
+
+  publish-gitea:
     needs: build
     if: ${{ github.server_url != 'https://github.com' }}
     runs-on: ubuntu-latest
