@@ -2,15 +2,18 @@ use crate::{
     document::SharedDocument,
     fonts::{AvailableFont, FontCatalog},
     model::{
-        BackgroundStyle, Design, DesignColor, ELEMENT_POSITION_LIMIT, ElementKind, History,
-        IMAGE_WIDTH_LIMIT, ShapeKind, TextFont,
+        BackgroundStyle, Design, DesignColor, ELEMENT_POSITION_LIMIT, Element, ElementKind,
+        History, IMAGE_WIDTH_LIMIT, ImageAsset, ShapeKind, TextFont,
     },
+    production::{self, IssueSeverity, PreflightIssue, RowPreflight},
     render::{
         TextureMap, element_bounds, export_pdf_series, export_pdf_sheet, export_pixel_size,
         export_png, hit_test, load_texture, paint_design, paint_preview, paint_trim_boundary,
         render_project_preview_png, selection_bounds, selection_handles,
     },
     series::SeriesData,
+    svg,
+    templates::{self, DesignTemplate, SavedPalette, SavedStyle},
     theme::{ACCENT, INK, MINT, MUTED, PAPER, SURFACE, display_font, icon, icon_text},
 };
 use eframe::egui::{
@@ -18,7 +21,9 @@ use eframe::egui::{
     StrokeKind, Ui, Vec2, vec2,
 };
 use std::{
+    collections::HashMap,
     fs,
+    hash::{Hash, Hasher},
     path::PathBuf,
     sync::mpsc::{self, Receiver},
 };
@@ -32,6 +37,38 @@ enum Tool {
     Image,
     Background,
     Series,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportKind {
+    Png,
+    PdfSheet,
+    PdfSeries,
+    Svg,
+}
+
+#[derive(Clone, Copy)]
+enum LibraryAction {
+    ApplyBuiltin(usize),
+    SaveTemplate,
+    LoadTemplate,
+    SavePalette,
+    LoadPalette,
+    SaveStyle,
+    LoadStyle,
+}
+
+#[derive(Clone)]
+enum PendingLibraryUpdate {
+    Design(Design),
+    Style(SavedStyle, Vec<u64>),
+}
+
+struct ExportPreflightCache {
+    design: Design,
+    series_signature: u64,
+    design_issues: Vec<PreflightIssue>,
+    row_issues: Vec<RowPreflight>,
 }
 
 #[derive(Clone, Copy)]
@@ -51,6 +88,11 @@ enum CanvasInteraction {
         center: egui::Pos2,
         rotation: f32,
     },
+    ResizeSelection {
+        id: u64,
+        pivot: egui::Pos2,
+        start_distance: f32,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -66,7 +108,10 @@ enum ElementAlignment {
 impl CanvasInteraction {
     fn id(self) -> u64 {
         match self {
-            Self::Move { id } | Self::Resize { id, .. } | Self::ResizeShape { id, .. } => id,
+            Self::Move { id }
+            | Self::Resize { id, .. }
+            | Self::ResizeShape { id, .. }
+            | Self::ResizeSelection { id, .. } => id,
         }
     }
 }
@@ -113,6 +158,12 @@ pub struct ButtonStudio {
     document_revision: u64,
     history: History,
     selected: Option<u64>,
+    selected_ids: Vec<u64>,
+    clipboard: Vec<Element>,
+    clipboard_assets: HashMap<String, ImageAsset>,
+    layer_drag_source: Option<u64>,
+    keep_proportions: bool,
+    snapping_enabled: bool,
     tool: Tool,
     draft_text: String,
     draft_text_curvature: f32,
@@ -125,6 +176,8 @@ pub struct ButtonStudio {
     status_is_error: bool,
     show_guides: bool,
     canvas_interaction: Option<CanvasInteraction>,
+    resize_snapshot: Vec<Element>,
+    marquee_start: Option<egui::Pos2>,
     font_catalog: FontCatalog,
     font_search: String,
     font_browser_open: bool,
@@ -133,6 +186,20 @@ pub struct ButtonStudio {
     pending_font_change: Option<(u64, TextFont)>,
     pending_project: Option<(Design, PathBuf)>,
     project_paths: Receiver<PathBuf>,
+    library_open: bool,
+    export_review_open: bool,
+    export_kind: ExportKind,
+    export_start: usize,
+    export_end: usize,
+    export_copies: usize,
+    export_preview_entry: usize,
+    skip_invalid_rows: bool,
+    export_preflight_cache: Option<ExportPreflightCache>,
+    saved_palette: Option<SavedPalette>,
+    pending_library_update: Option<PendingLibraryUpdate>,
+    library_template_name: String,
+    help_open: bool,
+    confirm_clear: bool,
 }
 
 impl ButtonStudio {
@@ -163,6 +230,12 @@ impl ButtonStudio {
             document_revision,
             history: History::default(),
             selected,
+            selected_ids: selected.into_iter().collect(),
+            clipboard: Vec::new(),
+            clipboard_assets: HashMap::new(),
+            layer_drag_source: None,
+            keep_proportions: false,
+            snapping_enabled: true,
             tool: Tool::Select,
             draft_text: "YOUR TEXT".to_owned(),
             draft_text_curvature: 0.0,
@@ -175,6 +248,8 @@ impl ButtonStudio {
             status_is_error: false,
             show_guides: true,
             canvas_interaction: None,
+            resize_snapshot: Vec::new(),
+            marquee_start: None,
             font_catalog,
             font_search: String::new(),
             font_browser_open: false,
@@ -183,6 +258,20 @@ impl ButtonStudio {
             pending_font_change: None,
             pending_project: None,
             project_paths,
+            library_open: false,
+            export_review_open: false,
+            export_kind: ExportKind::PdfSheet,
+            export_start: 1,
+            export_end: 1,
+            export_copies: 1,
+            export_preview_entry: 1,
+            skip_invalid_rows: false,
+            export_preflight_cache: None,
+            saved_palette: None,
+            pending_library_update: None,
+            library_template_name: "My button template".into(),
+            help_open: false,
+            confirm_clear: false,
         }
     }
 
@@ -204,6 +293,11 @@ impl ButtonStudio {
             .selected
             .filter(|id| self.design.element(*id).is_some())
             .or_else(|| self.design.elements.last().map(|element| element.id));
+        self.selected_ids
+            .retain(|id| self.design.element(*id).is_some());
+        if self.selected_ids.is_empty() {
+            self.selected_ids = self.selected.into_iter().collect();
+        }
         self.reload_textures(context);
         self.set_status("Design updated through MCP", false);
     }
@@ -270,36 +364,23 @@ impl ButtonStudio {
                         if ui
                             .add(
                                 Button::new(
-                                    RichText::new(icon_text("download", "Export PNG"))
+                                    RichText::new(icon_text("download", "Export & review"))
                                         .strong()
                                         .color(Color32::WHITE),
                                 )
                                 .fill(ACCENT)
-                                .min_size(vec2(132.0, 40.0)),
+                                .min_size(vec2(150.0, 40.0)),
                             )
-                            .on_hover_text("Export a transparent 300-DPI PNG")
+                            .on_hover_text("Check production warnings and export options")
                             .clicked()
                         {
-                            self.export_design();
+                            self.open_export_review();
                         }
-                        if ui
-                            .add(
-                                Button::new(
-                                    RichText::new(icon_text("printer", "Export PDF"))
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                )
-                                .fill(MINT)
-                                .min_size(vec2(126.0, 40.0)),
-                            )
-                            .on_hover_text(if self.series_data.is_some() {
-                                "Export one personalized button per CSV row"
-                            } else {
-                                "Export a print-ready A4 sheet"
-                            })
-                            .clicked()
-                        {
-                            self.export_pdf_design();
+                        if ui.button(icon_text("library", "Library")).clicked() {
+                            self.library_open = true;
+                        }
+                        if ui.button(icon_text("circle-help", "Help")).clicked() {
+                            self.help_open = true;
                         }
                         if ui
                             .add(Button::new(icon_text("save", "Save")).min_size(vec2(88.0, 40.0)))
@@ -330,7 +411,7 @@ impl ButtonStudio {
                         )
                         .clicked()
                         {
-                            self.clear_canvas();
+                            self.confirm_clear = true;
                         }
                         if top_icon_button(ui, "redo-2", "Redo", self.history.can_redo()).clicked()
                         {
@@ -493,6 +574,7 @@ impl ButtonStudio {
                             .color(MUTED),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new("BLEED · TRIM · SAFE").size(9.0).color(MUTED));
                         let selected_name = self
                             .selected
                             .and_then(|id| self.design.element(id))
@@ -533,10 +615,43 @@ impl ButtonStudio {
                         radius,
                         &self.design,
                         &self.textures,
-                        self.selected,
+                        self.selected.filter(|_| self.selected_ids.len() <= 1),
                     );
+                    if self.selected_ids.len() > 1 {
+                        let combined = self
+                            .selected_ids
+                            .iter()
+                            .filter_map(|id| self.design.element(*id))
+                            .map(|element| selection_bounds(&painter, center, radius, element))
+                            .reduce(|a, b| a.union(b));
+                        if let Some(bounds) = combined {
+                            painter.rect_stroke(
+                                bounds,
+                                0.0,
+                                Stroke::new(1.5, ACCENT),
+                                StrokeKind::Outside,
+                            );
+                            for handle in selection_handles(bounds, rect) {
+                                painter.circle_filled(handle, 4.5, Color32::WHITE);
+                                painter.circle_stroke(handle, 4.5, Stroke::new(1.0, ACCENT));
+                            }
+                        }
+                    }
                     if self.show_guides {
+                        painter.circle_stroke(
+                            center,
+                            radius,
+                            Stroke::new(1.0, Color32::from_rgba_unmultiplied(224, 153, 45, 120)),
+                        );
                         paint_trim_boundary(&painter, center, radius, &self.design);
+                        let safe_radius = ((self.design.diameter_mm as f32 / 2.0 - 2.0).max(0.0))
+                            / (self.design.artwork_diameter_mm() / 2.0)
+                            * radius;
+                        painter.circle_stroke(
+                            center,
+                            safe_radius,
+                            Stroke::new(1.0, Color32::from_rgba_unmultiplied(54, 148, 113, 150)),
+                        );
                     }
                     painter.rect_stroke(
                         rect,
@@ -548,7 +663,8 @@ impl ButtonStudio {
                     if response.clicked()
                         && let Some(pointer) = response.interact_pointer_pos()
                     {
-                        self.selected = hit_test(&painter, pointer, center, radius, &self.design);
+                        let hit = hit_test(&painter, pointer, center, radius, &self.design);
+                        self.select_hit(hit, ui.input(|input| input.modifiers.shift));
                         if self.selected.is_some() {
                             self.tool = Tool::Select;
                         }
@@ -557,52 +673,84 @@ impl ButtonStudio {
                     if response.drag_started()
                         && let Some(pointer) = response.interact_pointer_pos()
                     {
-                        let resize = self.selected.and_then(|id| {
-                            let element = self.design.element(id)?;
-                            let bounds = selection_bounds(&painter, center, radius, element);
-                            resize_handle_at(pointer, bounds, rect).map(|_| {
-                                if let ElementKind::Shape {
-                                    shape,
-                                    size,
-                                    width,
-                                    height,
-                                } = &element.kind
-                                {
-                                    let (width, height) =
-                                        shape_layer_dimensions(*shape, *size, *width, *height);
-                                    CanvasInteraction::ResizeShape {
+                        let resize = if self.selected_ids.len() > 1 {
+                            let snapshot =
+                                crate::editor::resize_snapshot(&self.design, &self.selected_ids);
+                            crate::editor::composition_bounds(&snapshot).and_then(|bounds| {
+                                let screen = egui::Rect::from_min_max(
+                                    center + bounds.min.to_vec2() * radius,
+                                    center + bounds.max.to_vec2() * radius,
+                                )
+                                .expand(5.0);
+                                resize_handle_at(pointer, screen, rect).and_then(|_| {
+                                    let id = self.selected?;
+                                    let pivot = center + bounds.center().to_vec2() * radius;
+                                    self.resize_snapshot = snapshot;
+                                    Some(CanvasInteraction::ResizeSelection {
                                         id,
+                                        pivot,
+                                        start_distance: pointer.distance(pivot).max(1.0),
+                                    })
+                                })
+                            })
+                        } else {
+                            self.selected.and_then(|id| {
+                                let element = self.design.element(id)?;
+                                if element.locked || !element.visible {
+                                    return None;
+                                }
+                                let bounds = selection_bounds(&painter, center, radius, element);
+                                resize_handle_at(pointer, bounds, rect).map(|_| {
+                                    if let ElementKind::Shape {
+                                        shape,
+                                        size,
                                         width,
                                         height,
-                                        center: center
-                                            + vec2(element.position[0], element.position[1])
-                                                * radius,
-                                        rotation: element.rotation,
+                                    } = &element.kind
+                                    {
+                                        let (width, height) =
+                                            shape_layer_dimensions(*shape, *size, *width, *height);
+                                        CanvasInteraction::ResizeShape {
+                                            id,
+                                            width,
+                                            height,
+                                            center: center
+                                                + vec2(element.position[0], element.position[1])
+                                                    * radius,
+                                            rotation: element.rotation,
+                                        }
+                                    } else {
+                                        CanvasInteraction::Resize {
+                                            id,
+                                            start_distance: pointer
+                                                .distance(
+                                                    center
+                                                        + vec2(
+                                                            element.position[0],
+                                                            element.position[1],
+                                                        ) * radius,
+                                                )
+                                                .max(1.0),
+                                            start_size: element_size(&element.kind),
+                                        }
                                     }
-                                } else {
-                                    CanvasInteraction::Resize {
-                                        id,
-                                        start_distance: pointer
-                                            .distance(
-                                                center
-                                                    + vec2(
-                                                        element.position[0],
-                                                        element.position[1],
-                                                    ) * radius,
-                                            )
-                                            .max(1.0),
-                                        start_size: element_size(&element.kind),
-                                    }
-                                }
+                                })
                             })
-                        });
+                        };
                         let interaction = resize.or_else(|| {
                             hit_test(&painter, pointer, center, radius, &self.design)
                                 .map(|id| CanvasInteraction::Move { id })
                         });
+                        if interaction.is_none() {
+                            self.marquee_start = Some(pointer);
+                        }
 
                         if let Some(interaction) = interaction {
                             self.selected = Some(interaction.id());
+                            if !self.selected_ids.contains(&interaction.id()) {
+                                self.selected_ids =
+                                    crate::editor::selection_ids(&self.design, &[interaction.id()]);
+                            }
                             self.canvas_interaction = Some(interaction);
                             self.tool = Tool::Select;
                             self.history.record(self.design.clone());
@@ -610,13 +758,129 @@ impl ButtonStudio {
                     }
 
                     if response.dragged() {
+                        if self.canvas_interaction.is_none()
+                            && let (Some(start), Some(pointer)) =
+                                (self.marquee_start, response.interact_pointer_pos())
+                        {
+                            let marquee = egui::Rect::from_two_pos(start, pointer);
+                            painter.rect_stroke(
+                                marquee,
+                                0.0,
+                                Stroke::new(1.0, ACCENT),
+                                StrokeKind::Outside,
+                            );
+                        }
                         match self.canvas_interaction {
+                            Some(CanvasInteraction::ResizeSelection {
+                                pivot,
+                                start_distance,
+                                ..
+                            }) => {
+                                if let Some(pointer) = response.interact_pointer_pos() {
+                                    crate::editor::resize_from_snapshot(
+                                        &mut self.design,
+                                        &self.resize_snapshot,
+                                        pointer.distance(pivot) / start_distance,
+                                    );
+                                }
+                            }
                             Some(CanvasInteraction::Move { id }) => {
                                 let delta = ui.input(|input| input.pointer.delta()) / radius;
-                                if let Some(element) = self.design.element_mut(id) {
-                                    element.position[0] += delta.x;
-                                    element.position[1] += delta.y;
-                                    clamp_element_position(&mut element.position);
+                                let ids = if self.selected_ids.contains(&id) {
+                                    self.selected_ids.clone()
+                                } else {
+                                    vec![id]
+                                };
+                                crate::editor::move_selection(
+                                    &mut self.design,
+                                    &ids,
+                                    [delta.x, delta.y],
+                                );
+                                if self.snapping_enabled {
+                                    let bounds = self
+                                        .selected_ids
+                                        .iter()
+                                        .filter(|sid| ids.contains(sid))
+                                        .filter_map(|sid| self.design.element(*sid))
+                                        .map(|e| selection_bounds(&painter, center, radius, e))
+                                        .reduce(|a, b| a.union(b));
+                                    if let Some(bounds) = bounds {
+                                        let nx = [
+                                            (bounds.left() - center.x) / radius,
+                                            (bounds.center().x - center.x) / radius,
+                                            (bounds.right() - center.x) / radius,
+                                        ];
+                                        let ny = [
+                                            (bounds.top() - center.y) / radius,
+                                            (bounds.center().y - center.y) / radius,
+                                            (bounds.bottom() - center.y) / radius,
+                                        ];
+                                        let trim = self.design.trim_ratio();
+                                        let safe = (self.design.diameter_mm as f32 - 4.0).max(0.0)
+                                            / self.design.artwork_diameter_mm();
+                                        let mut xs =
+                                            vec![-1.0, 0.0, 1.0, -trim, 0.0, trim, -safe, safe];
+                                        let mut ys = xs.clone();
+                                        for other in self.design.elements.iter().filter(|other| {
+                                            other.visible && !ids.contains(&other.id)
+                                        }) {
+                                            let b =
+                                                selection_bounds(&painter, center, radius, other);
+                                            xs.extend([
+                                                (b.left() - center.x) / radius,
+                                                (b.center().x - center.x) / radius,
+                                                (b.right() - center.x) / radius,
+                                            ]);
+                                            ys.extend([
+                                                (b.top() - center.y) / radius,
+                                                (b.center().y - center.y) / radius,
+                                                (b.bottom() - center.y) / radius,
+                                            ]);
+                                        }
+                                        let sx = crate::editor::snap_bounds_axis(
+                                            nx[0],
+                                            nx[1],
+                                            nx[2],
+                                            &xs,
+                                            12.0 / radius,
+                                        );
+                                        let sy = crate::editor::snap_bounds_axis(
+                                            ny[0],
+                                            ny[1],
+                                            ny[2],
+                                            &ys,
+                                            12.0 / radius,
+                                        );
+                                        let correction = [
+                                            sx.map_or(0.0, |(d, _)| d),
+                                            sy.map_or(0.0, |(d, _)| d),
+                                        ];
+                                        crate::editor::move_selection(
+                                            &mut self.design,
+                                            &ids,
+                                            correction,
+                                        );
+                                        if let Some((_, guide)) = sx {
+                                            let x = center.x + guide * radius;
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(x, rect.top()),
+                                                    egui::pos2(x, rect.bottom()),
+                                                ],
+                                                Stroke::new(1.0, ACCENT),
+                                            );
+                                        }
+                                        if let Some((_, guide)) = sy {
+                                            let y = center.y + guide * radius;
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(rect.left(), y),
+                                                    egui::pos2(rect.right(), y),
+                                                ],
+                                                Stroke::new(1.0, ACCENT),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             Some(CanvasInteraction::Resize {
@@ -675,11 +939,55 @@ impl ButtonStudio {
                         }
                     }
 
+                    if response.drag_stopped()
+                        && let (Some(start), Some(pointer)) =
+                            (self.marquee_start.take(), response.interact_pointer_pos())
+                    {
+                        let marquee = egui::Rect::from_two_pos(start, pointer);
+                        self.selected_ids = self
+                            .design
+                            .elements
+                            .iter()
+                            .filter(|element| {
+                                element.visible
+                                    && !element.locked
+                                    && selection_bounds(&painter, center, radius, element)
+                                        .intersects(marquee)
+                            })
+                            .map(|element| element.id)
+                            .collect();
+                        self.selected_ids =
+                            crate::editor::selection_ids(&self.design, &self.selected_ids);
+                        self.selected = self.selected_ids.last().copied();
+                        self.tool = Tool::Select;
+                    }
+
                     if !ui.input(|input| input.pointer.primary_down()) {
                         self.canvas_interaction = None;
+                        self.resize_snapshot.clear();
                     }
                     let resize_cursor = response.hover_pos().and_then(|pointer| {
+                        if self.selected_ids.len() > 1 {
+                            let snapshot =
+                                crate::editor::resize_snapshot(&self.design, &self.selected_ids);
+                            let bounds = crate::editor::composition_bounds(&snapshot)?;
+                            let screen = egui::Rect::from_min_max(
+                                center + bounds.min.to_vec2() * radius,
+                                center + bounds.max.to_vec2() * radius,
+                            )
+                            .expand(5.0);
+                            return resize_handle_at(pointer, screen, rect).map(|index| {
+                                if index == 0 || index == 3 {
+                                    egui::CursorIcon::ResizeNwSe
+                                } else {
+                                    egui::CursorIcon::ResizeNeSw
+                                }
+                            });
+                        }
                         let element = self.selected.and_then(|id| self.design.element(id))?;
+                        if element.locked {
+                            return None;
+                        }
                         resize_handle_at(
                             pointer,
                             selection_bounds(&painter, center, radius, element),
@@ -718,91 +1026,64 @@ impl ButtonStudio {
         let mut changed = false;
         let mut open_font_browser = false;
 
+        let artwork_mm = self.design.artwork_diameter_mm();
         if let Some(element) = self.design.element_mut(id) {
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                let mut label = element
+                    .name_override
+                    .clone()
+                    .unwrap_or_else(|| element.name());
+                if ui.text_edit_singleline(&mut label).changed() {
+                    element.name_override = if label.trim().is_empty() {
+                        None
+                    } else {
+                        Some(label)
+                    };
+                    changed = true;
+                }
+            });
+            changed |= ui.checkbox(&mut element.locked, "Lock layer").changed();
+            if element.locked {
+                ui.label(
+                    RichText::new("Locked layers cannot be transformed or edited.").color(MUTED),
+                );
+                if changed {
+                    self.history.record(previous);
+                }
+                return;
+            }
             match &mut element.kind {
                 ElementKind::Text {
                     text,
-                    font_size,
                     font,
                     curvature,
+                    ..
                 } => {
                     ui.label(section_label("CONTENT"));
                     changed |= ui.text_edit_multiline(text).changed();
-                    changed |= ui
-                        .add(egui::Slider::new(font_size, 0.025..=0.2).text("Size"))
-                        .changed();
                     ui.add_space(6.0);
                     ui.label(section_label("LAYOUT"));
                     changed |= text_arc_controls(ui, curvature);
                     ui.add_space(6.0);
                     open_font_browser = font_picker_button(ui, font, &self.font_catalog.available);
                 }
-                ElementKind::Shape {
-                    shape,
-                    size,
-                    width,
-                    height,
-                } => {
-                    ui.label(section_label("SIZE"));
-                    let (width_ratio, height_ratio) =
-                        shape_layer_dimensions(*shape, *size, *width, *height);
-                    let mut display_width = width_ratio * 100.0;
-                    let mut display_height = height_ratio * 100.0;
-                    ui.horizontal(|ui| {
-                        ui.label("Width");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut display_width)
-                                    .range(2.0..=200.0)
-                                    .speed(1.0)
-                                    .suffix("%"),
-                            )
-                            .changed();
-                        ui.label("Height");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut display_height)
-                                    .range(2.0..=200.0)
-                                    .speed(1.0)
-                                    .suffix("%"),
-                            )
-                            .changed();
-                    });
-                    if changed {
-                        *width = Some(display_width / 100.0);
-                        *height = Some(display_height / 100.0);
-                    }
-                    ui.label(
-                        RichText::new("Hold Shift while dragging a corner to keep the ratio")
-                            .size(11.0)
-                            .color(MUTED),
-                    );
-                }
+                ElementKind::Shape { .. } => {}
                 ElementKind::Image {
-                    width,
-                    bleed_to_square,
-                    ..
+                    bleed_to_square, ..
                 } => {
-                    ui.label(section_label("SIZE"));
-                    changed |= ui
-                        .add(egui::Slider::new(width, 0.08..=IMAGE_WIDTH_LIMIT).text("Width"))
-                        .changed();
                     changed |= ui
                         .checkbox(bleed_to_square, "Bleed edges to square")
                         .changed();
                 }
                 ElementKind::QrCode {
                     content,
-                    size,
+                    size: _,
                     background,
                     transparent_background,
                 } => {
                     ui.label(section_label("CONTENT"));
                     changed |= ui.text_edit_multiline(content).changed();
-                    ui.label(section_label("SIZE"));
-                    changed |= ui
-                        .add(egui::Slider::new(size, 0.08..=1.2).text("Scale"))
-                        .changed();
                     changed |= ui
                         .checkbox(transparent_background, "Transparent background")
                         .changed();
@@ -817,31 +1098,93 @@ impl ButtonStudio {
                 }
             }
 
+            ui.label(section_label("PHYSICAL SIZE"));
+            let (mut width_mm, mut height_mm) = {
+                let (w, h) = crate::editor::element_dimensions_ratio(element);
+                (w * artwork_mm, h * artwork_mm)
+            };
+            let before_size = (width_mm, height_mm);
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut width_mm)
+                        .range(0.5..=artwork_mm * 3.0)
+                        .speed(0.1)
+                        .suffix(" mm"),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut height_mm)
+                        .range(0.5..=artwork_mm * 3.0)
+                        .speed(0.1)
+                        .suffix(" mm"),
+                );
+            });
+            ui.checkbox(&mut self.keep_proportions, "Keep proportions while editing");
+            if (width_mm, height_mm) != before_size {
+                crate::editor::set_element_dimensions(
+                    element,
+                    width_mm / artwork_mm,
+                    height_mm / artwork_mm,
+                    self.keep_proportions,
+                );
+                changed = true;
+            }
+
             ui.add_space(6.0);
             ui.label(section_label("POSITION"));
-            changed |= ui
-                .add(
-                    egui::Slider::new(
-                        &mut element.position[0],
-                        -ELEMENT_POSITION_LIMIT..=ELEMENT_POSITION_LIMIT,
-                    )
-                    .text("X"),
-                )
-                .changed();
-            changed |= ui
-                .add(
-                    egui::Slider::new(
-                        &mut element.position[1],
-                        -ELEMENT_POSITION_LIMIT..=ELEMENT_POSITION_LIMIT,
-                    )
-                    .text("Y"),
-                )
-                .changed();
+            ui.checkbox(&mut self.snapping_enabled, "Snap while dragging");
+            ui.horizontal(|ui| {
+                ui.label("X mm");
+                let mut x_mm = (element.position[0] + 1.0) * artwork_mm * 0.5;
+                if ui
+                    .add(egui::DragValue::new(&mut x_mm).speed(0.1).suffix(" mm"))
+                    .changed()
+                {
+                    element.position[0] = (x_mm * 2.0 / artwork_mm - 1.0).clamp(-1.0, 1.0);
+                    changed = true;
+                }
+                ui.label("Y mm");
+                let mut y_mm = (element.position[1] + 1.0) * artwork_mm * 0.5;
+                if ui
+                    .add(egui::DragValue::new(&mut y_mm).speed(0.1).suffix(" mm"))
+                    .changed()
+                {
+                    element.position[1] = (y_mm * 2.0 / artwork_mm - 1.0).clamp(-1.0, 1.0);
+                    changed = true;
+                }
+            });
             ui.add_space(6.0);
             ui.label(section_label("ROTATION"));
             changed |= ui
                 .add(egui::Slider::new(&mut element.rotation, -180.0..=180.0).suffix("°"))
                 .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut element.rotation)
+                        .range(-180.0..=180.0)
+                        .speed(0.25)
+                        .suffix("°"),
+                )
+                .changed();
+            {
+                ui.horizontal(|ui| {
+                    let can_flip = matches!(
+                        element.kind,
+                        ElementKind::Image { .. } | ElementKind::Shape { .. }
+                    );
+                    if can_flip && ui.button("Flip H").clicked() {
+                        element.flip_x = !element.flip_x;
+                        changed = true;
+                    }
+                    if can_flip && ui.button("Flip V").clicked() {
+                        element.flip_y = !element.flip_y;
+                        changed = true;
+                    }
+                    if ui.button("Center").clicked() && !element.locked {
+                        element.position = [0.0, 0.0];
+                        changed = true;
+                    }
+                });
+            }
 
             if !matches!(element.kind, ElementKind::Image { .. }) {
                 ui.add_space(6.0);
@@ -862,6 +1205,7 @@ impl ButtonStudio {
                 changed = true;
             }
             changed |= ui.checkbox(&mut element.visible, "Visible").changed();
+            changed |= crate::appearance::controls(ui, element, artwork_mm);
         }
 
         if self.align_reference == Some(id)
@@ -899,7 +1243,7 @@ impl ButtonStudio {
             });
 
         let mut alignment = None;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (value, icon_name, tooltip) in [
                 (ElementAlignment::Left, "align-start-vertical", "Align left"),
                 (
@@ -928,13 +1272,24 @@ impl ButtonStudio {
 
         if let Some(alignment) = alignment {
             let painter = ui.painter().clone();
-            if align_element(
-                &mut self.design,
-                &painter,
-                id,
-                self.align_reference,
-                alignment,
-            ) {
+            let aligned = if self.selected_ids.len() > 1 {
+                align_selection(
+                    &mut self.design,
+                    &painter,
+                    &self.selected_ids,
+                    self.align_reference,
+                    alignment,
+                )
+            } else {
+                align_element(
+                    &mut self.design,
+                    &painter,
+                    id,
+                    self.align_reference,
+                    alignment,
+                )
+            };
+            if aligned {
                 changed = true;
                 self.set_status("Layer aligned", false);
             }
@@ -1091,11 +1446,11 @@ impl ButtonStudio {
             if ui
                 .add_sized(
                     [ui.available_width(), 42.0],
-                    Button::new(icon_text("printer", "Export series PDF")),
+                    Button::new(icon_text("printer", "Review series export")),
                 )
                 .clicked()
             {
-                self.export_pdf_design();
+                self.open_export_review();
             }
             if ui.button(icon_text("x", "Remove series data")).clicked() {
                 self.series_data = None;
@@ -1135,7 +1490,7 @@ impl ButtonStudio {
         }
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
-            for format in ["PNG", "JPEG", "WEBP"] {
+            for format in ["PNG", "JPEG", "WEBP", "SVG"] {
                 ui.label(
                     RichText::new(format)
                         .size(10.0)
@@ -1221,8 +1576,13 @@ impl ButtonStudio {
             self.design.background = color.into();
             changed = true;
         }
+        let background_swatches = self
+            .saved_palette
+            .as_ref()
+            .map(|palette| palette.colors.clone())
+            .unwrap_or_else(|| palette().to_vec());
         ui.horizontal_wrapped(|ui| {
-            for swatch in palette() {
+            for swatch in background_swatches {
                 let (rect, response) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
                 ui.painter()
                     .circle_filled(rect.center(), 14.0, Color32::from(swatch));
@@ -1255,6 +1615,7 @@ impl ButtonStudio {
             });
         });
         ui.add_space(5.0);
+        ui.label(RichText::new("Shift-click or drag on canvas to select several. Open Help for keyboard shortcuts.").size(10.0).color(MUTED));
 
         let rows = self
             .design
@@ -1266,6 +1627,10 @@ impl ButtonStudio {
         ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
             for (id, name, visible) in rows {
                 ui.horizontal(|ui| {
+                    let drag = ui.add(egui::Label::new("⠿").sense(Sense::drag()).selectable(false));
+                    if drag.drag_started() {
+                        self.layer_drag_source = Some(id);
+                    }
                     if icon_button(
                         ui,
                         if visible { "eye" } else { "eye-off" },
@@ -1280,19 +1645,77 @@ impl ButtonStudio {
                         }
                         self.history.record(previous);
                     }
-                    if ui
-                        .selectable_label(self.selected == Some(id), truncate(&name, 22))
-                        .clicked()
+                    let label =
+                        ui.selectable_label(self.selected_ids.contains(&id), truncate(&name, 22));
+                    if let Some(source) = self.layer_drag_source
+                        && label.rect.contains(ui.input(|input| {
+                            input.pointer.interact_pos().unwrap_or(label.rect.center())
+                        }))
+                        && ui.input(|input| input.pointer.any_released())
                     {
-                        self.selected = Some(id);
+                        let previous = self.design.clone();
+                        if self.design.reorder_layer(source, id) {
+                            self.history.record(previous);
+                        }
+                        self.layer_drag_source = None;
+                    }
+                    if label.clicked() {
+                        self.select_hit(Some(id), ui.input(|input| input.modifiers.shift));
                         self.tool = Tool::Select;
                     }
                 });
             }
         });
+        if ui.input(|input| input.pointer.any_released()) {
+            self.layer_drag_source = None;
+        }
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let enabled = self.selected.is_some();
+            if ui
+                .add_enabled(self.selected_ids.len() >= 2, Button::new("Group"))
+                .clicked()
+            {
+                self.toggle_group(false);
+            }
+            if ui
+                .add_enabled(self.selected_ids.len() >= 2, Button::new("Ungroup"))
+                .clicked()
+            {
+                self.toggle_group(true);
+            }
+            if ui.add_enabled(enabled, Button::new("Scale −")).clicked() {
+                self.bulk_transform(false, false);
+            }
+            if ui.add_enabled(enabled, Button::new("Scale +")).clicked() {
+                self.bulk_transform(false, true);
+            }
+            if ui.add_enabled(enabled, Button::new("Rotate −")).clicked() {
+                self.bulk_transform(true, false);
+            }
+            if ui.add_enabled(enabled, Button::new("Rotate +")).clicked() {
+                self.bulk_transform(true, true);
+            }
+            if ui
+                .add_enabled(self.selected_ids.len() >= 3, Button::new("Space H"))
+                .clicked()
+                && self.selected_ids.len() >= 3
+            {
+                let previous = self.design.clone();
+                if crate::editor::distribute_centers(&mut self.design, &self.selected_ids, true) {
+                    self.history.record(previous);
+                }
+            }
+            if ui
+                .add_enabled(self.selected_ids.len() >= 3, Button::new("Space V"))
+                .clicked()
+                && self.selected_ids.len() >= 3
+            {
+                let previous = self.design.clone();
+                if crate::editor::distribute_centers(&mut self.design, &self.selected_ids, false) {
+                    self.history.record(previous);
+                }
+            }
             if icon_button(ui, "arrow-up", "Bring forward", enabled).clicked() {
                 self.move_selected(true);
             }
@@ -1302,6 +1725,24 @@ impl ButtonStudio {
             if icon_button(ui, "copy", "Duplicate layer", enabled).clicked() {
                 self.duplicate_selected();
             }
+            if ui.add_enabled(enabled, Button::new("Copy")).clicked() {
+                self.copy_selected();
+            }
+            if ui
+                .add_enabled(!self.clipboard.is_empty(), Button::new("Paste"))
+                .clicked()
+            {
+                self.paste_clipboard(ui.ctx());
+            }
+            if ui
+                .add_enabled(
+                    enabled && !self.clipboard.is_empty(),
+                    Button::new("Paste style"),
+                )
+                .clicked()
+            {
+                self.paste_style();
+            }
             if icon_button(ui, "trash-2", "Delete layer", enabled).clicked() {
                 self.delete_selected();
             }
@@ -1310,7 +1751,48 @@ impl ButtonStudio {
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
         let accepts_global_keys = !context.egui_wants_keyboard_input();
-        let (undo, redo, save, open, export, duplicate, delete, nudge) = context.input(|input| {
+        let (tool_text, tool_shape, tool_image) = context.input(|input| {
+            (
+                accepts_global_keys
+                    && !input.modifiers.command
+                    && !input.modifiers.shift
+                    && input.key_pressed(Key::T),
+                accepts_global_keys
+                    && !input.modifiers.command
+                    && !input.modifiers.shift
+                    && input.key_pressed(Key::S),
+                accepts_global_keys
+                    && !input.modifiers.command
+                    && !input.modifiers.shift
+                    && input.key_pressed(Key::I),
+            )
+        });
+        if tool_text {
+            self.tool = Tool::Text;
+        }
+        if tool_shape {
+            self.tool = Tool::Shape;
+        }
+        if tool_image {
+            self.import_image(context);
+        }
+        let (
+            undo,
+            redo,
+            save,
+            open,
+            export,
+            duplicate,
+            delete,
+            copy,
+            paste,
+            paste_style,
+            group,
+            ungroup,
+            front,
+            back,
+            nudge,
+        ) = context.input(|input| {
             let command = input.modifiers.command;
             let shift = input.modifiers.shift;
             let nudge_step = if shift { 0.05 } else { 0.01 };
@@ -1328,14 +1810,23 @@ impl ButtonStudio {
                 None
             };
             (
-                command && !shift && input.key_pressed(Key::Z),
-                command && (input.key_pressed(Key::Y) || (shift && input.key_pressed(Key::Z))),
+                accepts_global_keys && command && !shift && input.key_pressed(Key::Z),
+                accepts_global_keys
+                    && command
+                    && (input.key_pressed(Key::Y) || (shift && input.key_pressed(Key::Z))),
                 command && input.key_pressed(Key::S),
                 command && input.key_pressed(Key::O),
-                command && input.key_pressed(Key::E),
-                command && input.key_pressed(Key::D),
+                accepts_global_keys && command && input.key_pressed(Key::E),
+                accepts_global_keys && command && input.key_pressed(Key::D),
                 accepts_global_keys
                     && (input.key_pressed(Key::Delete) || input.key_pressed(Key::Backspace)),
+                accepts_global_keys && command && !shift && input.key_pressed(Key::C),
+                accepts_global_keys && command && !shift && input.key_pressed(Key::V),
+                accepts_global_keys && command && shift && input.key_pressed(Key::V),
+                accepts_global_keys && command && !shift && input.key_pressed(Key::G),
+                accepts_global_keys && command && shift && input.key_pressed(Key::G),
+                accepts_global_keys && command && input.key_pressed(Key::PageUp),
+                accepts_global_keys && command && input.key_pressed(Key::PageDown),
                 nudge,
             )
         });
@@ -1352,7 +1843,7 @@ impl ButtonStudio {
             self.open_project(context);
         }
         if export {
-            self.export_design();
+            self.open_export_review();
         }
         if duplicate {
             self.duplicate_selected();
@@ -1360,14 +1851,31 @@ impl ButtonStudio {
         if delete {
             self.delete_selected();
         }
-        if let (Some(id), Some(delta)) = (self.selected, nudge) {
+        if copy {
+            self.copy_selected();
+        }
+        if paste {
+            self.paste_clipboard(context);
+        }
+        if paste_style {
+            self.paste_style();
+        }
+        if group {
+            self.toggle_group(false);
+        }
+        if ungroup {
+            self.toggle_group(true);
+        }
+        if front {
+            self.move_selected_to_edge(true);
+        }
+        if back {
+            self.move_selected_to_edge(false);
+        }
+        if let Some(delta) = nudge {
             let previous = self.design.clone();
-            if let Some(element) = self.design.element_mut(id) {
-                element.position[0] += delta[0];
-                element.position[1] += delta[1];
-                clamp_element_position(&mut element.position);
-                self.history.record(previous);
-            }
+            crate::editor::move_selection(&mut self.design, &self.selected_ids, delta);
+            self.history.record(previous);
         }
     }
 
@@ -1453,6 +1961,11 @@ impl ButtonStudio {
             Ok(series) => {
                 let rows = series.rows.len();
                 self.series_data = Some(series);
+                self.export_kind = ExportKind::PdfSeries;
+                self.export_start = 1;
+                self.export_end = rows;
+                self.export_preview_entry = 1;
+                self.export_preflight_cache = None;
                 self.set_status(format!("Imported {rows} series rows"), false);
             }
             Err(error) => self.set_status(error, true),
@@ -1587,6 +2100,45 @@ impl ButtonStudio {
                 self.set_status("Text font updated", false);
             }
         }
+
+        if let Some(update) = self.pending_library_update.take() {
+            match update {
+                PendingLibraryUpdate::Design(design) => {
+                    self.history.record(self.design.clone());
+                    self.design = design;
+                    self.selected = self.design.elements.last().map(|element| element.id);
+                    self.selected_ids = self.selected.into_iter().collect();
+                    self.reload_textures(context);
+                    self.set_status("Template applied", false);
+                }
+                PendingLibraryUpdate::Style(style, ids) => {
+                    let previous = self.design.clone();
+                    for id in ids {
+                        if let Some(element) = self.design.element_mut(id) {
+                            element.color = style.color;
+                            element.opacity = style.opacity;
+                            element.appearance = style.appearance.clone();
+                            if let ElementKind::Text {
+                                font, font_size, ..
+                            } = &mut element.kind
+                            {
+                                if let Some(saved_font) = &style.font {
+                                    *font = saved_font.clone();
+                                }
+                                if let Some(saved_size) = style.font_size {
+                                    *font_size = saved_size;
+                                }
+                            }
+                        }
+                    }
+                    if self.design != previous {
+                        self.history.record(previous);
+                        self.set_status("Saved style applied", false);
+                    }
+                }
+            }
+            self.export_preflight_cache = None;
+        }
     }
 
     fn font_browser(&mut self, context: &egui::Context) {
@@ -1689,57 +2241,658 @@ impl ButtonStudio {
         }
     }
 
-    fn export_design(&mut self) {
-        let file_name = format!("button-{}mm.png", self.design.diameter_mm);
+    fn open_export_review(&mut self) {
+        if let Some(series) = &self.series_data {
+            self.export_kind = ExportKind::PdfSeries;
+            self.export_start = self.export_start.clamp(1, series.rows.len());
+            self.export_end = self.export_end.clamp(self.export_start, series.rows.len());
+            self.export_preview_entry = self.export_preview_entry.clamp(1, series.rows.len());
+        } else if self.export_kind == ExportKind::PdfSeries {
+            self.export_kind = ExportKind::PdfSheet;
+        }
+        self.export_review_open = true;
+    }
+
+    fn refresh_export_preflight(&mut self) {
+        let signature = self.series_data.as_ref().map(series_signature).unwrap_or(0);
+        let cached = self.export_preflight_cache.as_ref().is_some_and(|cache| {
+            cache.design == self.design && cache.series_signature == signature
+        });
+        if cached {
+            return;
+        }
+        let design_issues = production::preflight_design(&self.design);
+        let row_issues = self
+            .series_data
+            .as_ref()
+            .map(|series| production::preflight_series(&self.design, &series.rows, 2))
+            .unwrap_or_default();
+        self.export_preflight_cache = Some(ExportPreflightCache {
+            design: self.design.clone(),
+            series_signature: signature,
+            design_issues,
+            row_issues,
+        });
+    }
+
+    fn export_review_window(&mut self, context: &egui::Context) {
+        if !self.export_review_open {
+            return;
+        }
+        self.refresh_export_preflight();
+        let mut open = self.export_review_open;
+        let design = self.design.clone();
+        let textures = self.textures.clone();
+        let series = self.series_data.clone();
+        let issues = self
+            .export_preflight_cache
+            .as_ref()
+            .map(|cache| cache.design_issues.clone())
+            .unwrap_or_default();
+        let row_issues = self
+            .export_preflight_cache
+            .as_ref()
+            .map(|cache| cache.row_issues.clone())
+            .unwrap_or_default();
+        let mut kind = self.export_kind;
+        let mut start = self.export_start;
+        let mut end = self.export_end;
+        let mut copies = self.export_copies;
+        let mut preview_entry = self.export_preview_entry;
+        let mut skip_invalid = self.skip_invalid_rows;
+        let mut run_export = false;
+        let mut close_window = false;
+
+        egui::Window::new("Review production export")
+            .id(egui::Id::new("production-export-review"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(vec2(760.0, 640.0))
+            .min_size(vec2(620.0, 500.0))
+            .max_height((context.content_rect().height() - 48.0).max(300.0))
+            .vscroll(true)
+            .show(context, |ui| {
+                ui.label(RichText::new("Review physical size, artwork boundaries, resolution, and personalization before saving.").color(MUTED));
+                ui.horizontal(|ui| {
+                    ui.label("Output");
+                    egui::ComboBox::from_id_salt("export-kind")
+                        .selected_text(export_kind_label(kind))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut kind, ExportKind::Png, "Transparent PNG");
+                            ui.selectable_value(&mut kind, ExportKind::PdfSheet, "A4 print sheet PDF");
+                            if series.is_some() { ui.selectable_value(&mut kind, ExportKind::PdfSeries, "Personalized series PDF"); }
+                            ui.selectable_value(&mut kind, ExportKind::Svg, "SVG");
+                        });
+                });
+                ui.separator();
+                ui.columns(2, |columns| {
+                    let preview_design = series.as_ref().filter(|_| kind == ExportKind::PdfSeries)
+                        .and_then(|data| data.rows.get(preview_entry.saturating_sub(1)))
+                        .map(|values| design.personalized(values))
+                        .unwrap_or_else(|| design.clone());
+                    columns[0].label(RichText::new("PREVIEW").size(10.0).strong().color(MUTED));
+                    let width = columns[0].available_width().min(280.0);
+                    let (rect, _) = columns[0].allocate_exact_size(vec2(width, width), Sense::hover());
+                    paint_preview(columns[0].painter(), rect, &preview_design, &textures);
+                    if kind == ExportKind::PdfSeries && let Some(data) = &series {
+                        columns[0].horizontal(|ui| {
+                            ui.label("Preview CSV entry");
+                            ui.add(egui::DragValue::new(&mut preview_entry).range(1..=data.rows.len()));
+                        });
+                        if let Some(row) = data.rows.get(preview_entry.saturating_sub(1)) {
+                            for (key, value) in row.iter().take(5) {
+                                columns[0].label(RichText::new(format!("{key}: {}", truncate(value, 32))).size(11.0).color(MUTED));
+                            }
+                        }
+                    }
+
+                    let pixels = export_pixel_size(&design);
+                    columns[1].label(RichText::new("PRODUCTION").size(10.0).strong().color(MUTED));
+                    columns[1].label(format!("Trim size: {} mm diameter", design.diameter_mm));
+                    columns[1].label(format!("Artwork including bleed: {:.1} mm diameter", design.artwork_diameter_mm()));
+                    columns[1].label(format!("PNG basis: {pixels} × {pixels} px · 300 DPI"));
+                    columns[1].label("PDF sheet: A4 · 210 × 297 mm · centered button layout");
+                    columns[1].add_space(8.0);
+
+                    if kind == ExportKind::PdfSeries && let Some(data) = &series {
+                        columns[1].label(RichText::new("CSV ROWS").size(10.0).strong().color(MUTED));
+                        columns[1].horizontal(|ui| {
+                            ui.label("From entry"); ui.add(egui::DragValue::new(&mut start).range(1..=data.rows.len()));
+                            ui.label("To"); ui.add(egui::DragValue::new(&mut end).range(1..=data.rows.len()));
+                        });
+                        if start > end { end = start; }
+                        columns[1].horizontal(|ui| {
+                            ui.label("Copies per entry"); ui.add(egui::DragValue::new(&mut copies).range(1..=999));
+                        });
+                        let selected_count = end.saturating_sub(start).saturating_add(1);
+                        let chosen_issues = row_issues.iter().filter(|row| row.row_number > start && row.row_number <= end + 1).collect::<Vec<_>>();
+                        let invalid = chosen_issues.iter().filter(|row| row.issues.iter().any(|i| i.severity == IssueSeverity::Error)).collect::<Vec<_>>();
+                        let export_count = selected_count.saturating_mul(copies);
+                        let valid_count = selected_count.saturating_sub(invalid.len());
+                        let actual_count = if skip_invalid { valid_count.saturating_mul(copies) } else { export_count };
+                        columns[1].label(format!("{selected_count} entries · {copies} copies each · {actual_count} buttons to export"));
+                        if skip_invalid && !invalid.is_empty() { columns[1].label(RichText::new(format!("{} invalid entries will be reported and skipped", invalid.len())).color(Color32::from_rgb(171, 105, 32))); }
+                        if !invalid.is_empty() {
+                            columns[1].checkbox(&mut skip_invalid, "Skip invalid rows and report them");
+                            for row in invalid.iter().take(8) {
+                                let details = row.issues.iter().filter(|i| i.severity == IssueSeverity::Error).map(|i| i.message.as_str()).collect::<Vec<_>>().join("; ");
+                                columns[1].colored_label(Color32::from_rgb(178, 63, 52), format!("CSV row {}: {}", row.row_number, truncate(&details, 90)));
+                            }
+                            if invalid.len() > 8 { columns[1].label(format!("… and {} more invalid rows", invalid.len() - 8)); }
+                        } else { columns[1].label(RichText::new("All selected CSV rows passed preflight.").color(MINT)); }
+                        if export_count > 10_000 { columns[1].colored_label(Color32::from_rgb(178, 63, 52), "Limit this batch to 10,000 buttons."); }
+                    }
+                });
+
+                if matches!(kind, ExportKind::PdfSheet | ExportKind::PdfSeries) {
+                    let count = if kind == ExportKind::PdfSeries {
+                        let invalid = row_issues.iter().filter(|row| row.row_number > start && row.row_number <= end + 1 && row.issues.iter().any(|issue| issue.severity == IssueSeverity::Error)).count();
+                        Some(end.saturating_sub(start).saturating_add(1).saturating_sub(if skip_invalid { invalid } else { 0 }).saturating_mul(copies))
+                    } else { None };
+                    ui.collapsing("A4 sheet placement", |ui| { production::paint_sheet_preview(ui, &design, count); });
+                }
+                ui.separator();
+                ui.label(RichText::new("PREFLIGHT").size(10.0).strong().color(MUTED));
+                let all_issues = if kind == ExportKind::PdfSeries {
+                    let mut all = issues.clone();
+                    for row in row_issues.iter().filter(|row| row.row_number > start && row.row_number <= end + 1) {
+                        all.extend(row.issues.iter().cloned());
+                    }
+                    all
+                } else { issues.clone() };
+                if all_issues.is_empty() { ui.label(RichText::new("No production issues found.").color(MINT)); }
+                else {
+                    egui::ScrollArea::vertical().max_height(112.0).show(ui, |ui| {
+                        for issue in all_issues.iter().take(14) { show_preflight_issue(ui, issue); }
+                        if all_issues.len() > 14 { ui.label(format!("… and {} more findings", all_issues.len() - 14)); }
+                    });
+                }
+                if kind == ExportKind::Svg && !svg::fallback_reasons(&design).is_empty() {
+                    ui.colored_label(Color32::from_rgb(171, 105, 32), "SVG will embed a 2400 px PNG to preserve background effects, curved text, QR codes, or other unsupported details. The artwork will not be editable as separate objects.");
+                }
+                if kind == ExportKind::Svg { ui.label(RichText::new("SVG fonts are not embedded; another viewer may substitute a font.").size(11.0).color(MUTED)); }
+
+                let base_errors = issues.iter().any(|issue| issue.severity == IssueSeverity::Error);
+                let selected_has_invalid = row_issues.iter().any(|row| row.row_number > start && row.row_number <= end + 1 && row.issues.iter().any(|issue| issue.severity == IssueSeverity::Error));
+                let series_valid = kind != ExportKind::PdfSeries || (series.is_some() && (!selected_has_invalid || skip_invalid));
+                let range_valid = series.as_ref().is_none_or(|data| start >= 1 && end >= start && end <= data.rows.len());
+                let too_many = kind == ExportKind::PdfSeries && end.saturating_sub(start).saturating_add(1).saturating_mul(copies) > 10_000;
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!base_errors && series_valid && range_valid && !too_many, Button::new(RichText::new("Export…").color(Color32::WHITE)).fill(ACCENT)).clicked() { run_export = true; }
+                    if ui.button("Close").clicked() { close_window = true; }
+                });
+            });
+
+        if close_window {
+            open = false;
+        }
+        self.export_review_open = open;
+        self.export_kind = kind;
+        self.export_start = start;
+        self.export_end = end;
+        self.export_copies = copies;
+        self.export_preview_entry = preview_entry;
+        self.skip_invalid_rows = skip_invalid;
+        if run_export && self.perform_export(kind, start, end, copies, skip_invalid) {
+            self.export_review_open = false;
+        }
+    }
+
+    fn perform_export(
+        &mut self,
+        kind: ExportKind,
+        start: usize,
+        end: usize,
+        copies: usize,
+        skip_invalid: bool,
+    ) -> bool {
+        let series_rows = if kind == ExportKind::PdfSeries {
+            let Some(series) = &self.series_data else {
+                self.set_status("Import a CSV before exporting a series", true);
+                return false;
+            };
+            let chosen = match production::select_rows(&series.rows, start, end, 1) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    self.set_status(error, true);
+                    return false;
+                }
+            };
+            let reports = production::preflight_series(&self.design, &chosen, start + 1);
+            let invalid = reports
+                .iter()
+                .filter(|row| {
+                    row.issues
+                        .iter()
+                        .any(|i| i.severity == IssueSeverity::Error)
+                })
+                .map(|row| row.row_number)
+                .collect::<Vec<_>>();
+            if !invalid.is_empty() && !skip_invalid {
+                self.set_status(
+                    format!(
+                        "Fix or skip invalid CSV rows: {}",
+                        format_row_numbers(&invalid)
+                    ),
+                    true,
+                );
+                return false;
+            }
+            let invalid_data_indices = invalid
+                .iter()
+                .map(|row| row - start - 1)
+                .collect::<std::collections::HashSet<_>>();
+            let valid_rows = chosen
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, row)| (!invalid_data_indices.contains(&index)).then_some(row))
+                .collect::<Vec<_>>();
+            if valid_rows.is_empty() {
+                self.set_status("No valid CSV rows remain in this range", true);
+                return false;
+            }
+            if self.design_issues_have_errors() {
+                self.set_status(
+                    "Resolve design-wide preflight errors before exporting",
+                    true,
+                );
+                return false;
+            }
+            let repeated = match production::select_rows(&valid_rows, 1, valid_rows.len(), copies) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    self.set_status(error, true);
+                    return false;
+                }
+            };
+            Some((repeated, invalid))
+        } else {
+            if let Some(issue) = production::preflight_design(&self.design)
+                .into_iter()
+                .find(|issue| issue.severity == IssueSeverity::Error)
+            {
+                self.set_status(issue.message, true);
+                return false;
+            }
+            None
+        };
+
+        let (filter, extension, filename) = match kind {
+            ExportKind::Png => (
+                "PNG image",
+                "png",
+                format!("button-{}mm.png", self.design.diameter_mm),
+            ),
+            ExportKind::PdfSheet => (
+                "PDF document",
+                "pdf",
+                format!("button-sheet-{}mm.pdf", self.design.diameter_mm),
+            ),
+            ExportKind::PdfSeries => (
+                "PDF document",
+                "pdf",
+                format!("button-series-{}mm.pdf", self.design.diameter_mm),
+            ),
+            ExportKind::Svg => (
+                "SVG artwork",
+                "svg",
+                format!("button-{}mm.svg", self.design.diameter_mm),
+            ),
+        };
         let Some(mut path) = rfd::FileDialog::new()
-            .add_filter("PNG image", &["png"])
-            .set_file_name(&file_name)
+            .add_filter(filter, &[extension])
+            .set_file_name(&filename)
             .save_file()
         else {
-            return;
+            return false;
         };
         if path.extension().is_none() {
-            path.set_extension("png");
+            path.set_extension(extension);
         }
-        match export_png(&self.design, &path) {
-            Ok(size) => self.set_status(format!("Exported {size} × {size} px PNG"), false),
+        let result = match kind {
+            ExportKind::Png => export_png(&self.design, &path)
+                .map(|pixels| (format!("Exported {pixels} × {pixels} px PNG"), Vec::new())),
+            ExportKind::PdfSheet => export_pdf_sheet(&self.design, &path)
+                .map(|count| (format!("Exported {count} buttons to A4 PDF"), Vec::new())),
+            ExportKind::PdfSeries => {
+                let (rows, skipped) = series_rows.expect("series export prepared");
+                export_pdf_series(&self.design, &rows, &path).map(|summary| {
+                    let skipped_text = if skipped.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · skipped CSV rows {}", format_row_numbers(&skipped))
+                    };
+                    (
+                        format!(
+                            "Exported {} personalized buttons across {} pages{}",
+                            summary.buttons, summary.pages, skipped_text
+                        ),
+                        Vec::new(),
+                    )
+                })
+            }
+            ExportKind::Svg => svg::export_svg(&self.design).and_then(|output| {
+                fs::write(&path, output.svg)
+                    .map_err(|error| format!("Could not save SVG: {error}"))
+                    .map(|()| ("SVG exported".to_owned(), output.warnings))
+            }),
+        };
+        match result {
+            Ok((message, warnings)) => {
+                let message = if warnings.is_empty() {
+                    message
+                } else {
+                    format!("{message} · {} export warning(s)", warnings.len())
+                };
+                self.set_status(message, false);
+                true
+            }
+            Err(error) => {
+                self.set_status(error, true);
+                false
+            }
+        }
+    }
+
+    fn design_issues_have_errors(&self) -> bool {
+        production::preflight_design(&self.design)
+            .iter()
+            .any(|issue| issue.severity == IssueSeverity::Error)
+    }
+
+    fn library_window(&mut self, context: &egui::Context) {
+        if !self.library_open {
+            return;
+        }
+        let mut open = self.library_open;
+        let mut action = None;
+        let mut template_name = self.library_template_name.clone();
+        let builtin = templates::builtin_templates();
+        egui::Window::new("Templates and styles")
+            .id(egui::Id::new("design-library"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(vec2(560.0, 500.0))
+            .max_height((context.content_rect().height() - 48.0).max(300.0))
+            .vscroll(true)
+            .show(context, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Start from a layout, or save reusable designs, colors, and object styles.",
+                    )
+                    .color(MUTED),
+                );
+                ui.label(
+                    RichText::new("BUILT-IN LAYOUTS")
+                        .size(10.0)
+                        .strong()
+                        .color(MUTED),
+                );
+                for (index, template) in builtin.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(&template.name);
+                            ui.label(RichText::new(&template.description).size(11.0).color(MUTED));
+                        });
+                        if ui.button("Use layout").clicked() {
+                            action = Some(LibraryAction::ApplyBuiltin(index));
+                        }
+                    });
+                }
+                ui.separator();
+                ui.label("Template name");
+                ui.text_edit_singleline(&mut template_name);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Save current as template…").clicked() {
+                        action = Some(LibraryAction::SaveTemplate);
+                    }
+                    if ui.button("Load template…").clicked() {
+                        action = Some(LibraryAction::LoadTemplate);
+                    }
+                    if ui.button("Save palette…").clicked() {
+                        action = Some(LibraryAction::SavePalette);
+                    }
+                    if ui.button("Load palette…").clicked() {
+                        action = Some(LibraryAction::LoadPalette);
+                    }
+                    if ui.button("Save selected style…").clicked() {
+                        action = Some(LibraryAction::SaveStyle);
+                    }
+                    if ui.button("Load/apply style…").clicked() {
+                        action = Some(LibraryAction::LoadStyle);
+                    }
+                });
+                if let Some(palette) = &self.saved_palette {
+                    ui.label(
+                        RichText::new(format!(
+                            "Active palette: {} ({} colors)",
+                            palette.name,
+                            palette.colors.len()
+                        ))
+                        .color(MINT),
+                    );
+                }
+            });
+        self.library_open = open;
+        self.library_template_name = template_name.clone();
+        if let Some(action) = action {
+            match action {
+                LibraryAction::ApplyBuiltin(index) => {
+                    if let Some(template) = builtin.get(index) {
+                        self.queue_design_update(context, template.design.clone());
+                    }
+                }
+                LibraryAction::SaveTemplate => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Button Studio template", &["buttontemplate", "json"])
+                        .set_file_name(format!("{}.buttontemplate", safe_file_stem(&template_name)))
+                        .save_file()
+                    {
+                        let template = DesignTemplate {
+                            name: template_name.clone(),
+                            description: "User-saved Button Studio layout".into(),
+                            design: self.design.clone(),
+                        };
+                        match templates::save_template(&path, &template) {
+                            Ok(()) => self.set_status("Template saved", false),
+                            Err(error) => self.set_status(error, true),
+                        }
+                    }
+                }
+                LibraryAction::LoadTemplate => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Button Studio template", &["buttontemplate", "json"])
+                        .pick_file()
+                    {
+                        match templates::load_template(&path) {
+                            Ok(template) => self.queue_design_update(context, template.design),
+                            Err(error) => self.set_status(error, true),
+                        }
+                    }
+                }
+                LibraryAction::SavePalette => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Palette", &["buttonpalette", "json"])
+                        .set_file_name("my-palette.buttonpalette")
+                        .save_file()
+                    {
+                        let palette = SavedPalette {
+                            name: path
+                                .file_stem()
+                                .and_then(|x| x.to_str())
+                                .unwrap_or("My palette")
+                                .to_owned(),
+                            colors: design_palette(&self.design),
+                        };
+                        match templates::save_palette(&path, &palette) {
+                            Ok(()) => self.set_status("Palette saved", false),
+                            Err(error) => self.set_status(error, true),
+                        }
+                    }
+                }
+                LibraryAction::LoadPalette => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Palette", &["buttonpalette", "json"])
+                        .pick_file()
+                    {
+                        match templates::load_palette(&path) {
+                            Ok(palette) => {
+                                self.saved_palette = Some(palette);
+                                self.set_status("Palette loaded and ready to apply", false)
+                            }
+                            Err(error) => self.set_status(error, true),
+                        }
+                    }
+                }
+                LibraryAction::SaveStyle => {
+                    if let Some(style) = self.selected_style() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Object style", &["buttonstyle", "json"])
+                            .set_file_name("my-style.buttonstyle")
+                            .save_file()
+                        {
+                            match templates::save_style(&path, &style) {
+                                Ok(()) => self.set_status("Style saved", false),
+                                Err(error) => self.set_status(error, true),
+                            }
+                        }
+                    } else {
+                        self.set_status("Select an object to save its style", true)
+                    }
+                }
+                LibraryAction::LoadStyle => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Object style", &["buttonstyle", "json"])
+                        .pick_file()
+                    {
+                        match templates::load_style(&path) {
+                            Ok(style) => self.queue_style_update(context, style),
+                            Err(error) => self.set_status(error, true),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn selected_style(&self) -> Option<SavedStyle> {
+        let element = self.selected.and_then(|id| self.design.element(id))?;
+        let (font, font_size) = match &element.kind {
+            ElementKind::Text {
+                font, font_size, ..
+            } => (Some(font.clone()), Some(*font_size)),
+            _ => (None, None),
+        };
+        Some(SavedStyle {
+            name: element.name(),
+            color: element.color,
+            font,
+            font_size,
+            opacity: element.opacity,
+            appearance: element.appearance.clone(),
+        })
+    }
+
+    fn queue_design_update(&mut self, context: &egui::Context, design: Design) {
+        match self
+            .font_catalog
+            .register_design_fonts(context, &design_fonts(&design))
+        {
+            Ok(()) => {
+                self.pending_library_update = Some(PendingLibraryUpdate::Design(design));
+                context.request_discard("activate template fonts");
+                context.request_repaint();
+            }
             Err(error) => self.set_status(error, true),
         }
     }
 
-    fn export_pdf_design(&mut self) {
-        let file_name = if self.series_data.is_some() {
-            format!("button-series-{}mm.pdf", self.design.diameter_mm)
-        } else {
-            format!("button-sheet-{}mm.pdf", self.design.diameter_mm)
-        };
-        let Some(mut path) = rfd::FileDialog::new()
-            .add_filter("PDF document", &["pdf"])
-            .set_file_name(&file_name)
-            .save_file()
-        else {
+    fn queue_style_update(&mut self, context: &egui::Context, style: SavedStyle) {
+        if let Some(font) = &style.font
+            && let Err(error) = self.font_catalog.ensure_registered(context, font)
+        {
+            self.set_status(error, true);
             return;
-        };
-        if path.extension().is_none() {
-            path.set_extension("pdf");
         }
-        if let Some(series) = &self.series_data {
-            match export_pdf_series(&self.design, &series.rows, &path) {
-                Ok(summary) => self.set_status(
-                    format!(
-                        "Exported {} personalized buttons across {} PDF pages",
-                        summary.buttons, summary.pages
-                    ),
-                    false,
-                ),
-                Err(error) => self.set_status(error, true),
-            }
-        } else {
-            match export_pdf_sheet(&self.design, &path) {
-                Ok(buttons) => self.set_status(format!("Exported {buttons} buttons to PDF"), false),
-                Err(error) => self.set_status(error, true),
-            }
+        self.pending_library_update = Some(PendingLibraryUpdate::Style(
+            style,
+            self.selected_ids.clone(),
+        ));
+        context.request_discard("activate saved style font");
+        context.request_repaint();
+    }
+
+    fn help_window(&mut self, context: &egui::Context) {
+        if !self.help_open {
+            return;
         }
+        let mut open = self.help_open;
+        egui::Window::new("Keyboard shortcuts")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                egui::Grid::new("shortcut-grid")
+                    .num_columns(2)
+                    .spacing(vec2(22.0, 6.0))
+                    .show(ui, |ui| {
+                        for (shortcut, action) in [
+                            ("T", "Add text"),
+                            ("S", "Add shape"),
+                            ("I", "Import image"),
+                            ("Cmd/Ctrl+D", "Duplicate selection"),
+                            ("Cmd/Ctrl+C / V", "Copy / paste objects"),
+                            ("Cmd/Ctrl+Shift+V", "Paste style"),
+                            ("Cmd/Ctrl+G / Shift+G", "Group / ungroup"),
+                            ("Cmd/Ctrl+E", "Export and review"),
+                            (
+                                "Cmd/Ctrl+PageUp / PageDown",
+                                "Bring to front / send to back",
+                            ),
+                            ("Arrow keys", "Nudge selection"),
+                            ("Shift + arrows", "Larger nudge"),
+                            ("Cmd/Ctrl+Z / Shift+Z", "Undo / redo"),
+                        ] {
+                            ui.label(RichText::new(shortcut).strong());
+                            ui.label(action);
+                            ui.end_row();
+                        }
+                    });
+                ui.label(
+                    RichText::new(
+                        "Shortcuts pause while a text field or other keyboard editor has focus.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                );
+            });
+        self.help_open = open;
+    }
+
+    fn clear_confirmation(&mut self, context: &egui::Context) {
+        if !self.confirm_clear {
+            return;
+        }
+        let mut open = true;
+        let mut clear = false;
+        let mut cancel = false;
+        egui::Window::new("Clear artwork?")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label("Remove all objects from this design? You can undo this change.");
+                ui.horizontal(|ui| {
+                    clear = ui.button("Clear artwork").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if clear {
+            self.clear_canvas();
+        }
+        self.confirm_clear = open && !clear && !cancel;
     }
 
     fn clear_canvas(&mut self) {
@@ -1753,12 +2906,14 @@ impl ButtonStudio {
     }
 
     fn duplicate_selected(&mut self) {
-        let Some(id) = self.selected else {
+        if self.selected.is_none() {
             return;
-        };
+        }
         self.history.record(self.design.clone());
-        if let Some(new_id) = self.design.duplicate(id) {
+        let new_ids = crate::editor::duplicate_selection(&mut self.design, &self.selected_ids);
+        if let Some(new_id) = new_ids.last().copied() {
             self.selected = Some(new_id);
+            self.selected_ids = new_ids;
             self.set_status("Layer duplicated", false);
         }
     }
@@ -1768,8 +2923,10 @@ impl ButtonStudio {
             return;
         };
         self.history.record(self.design.clone());
-        if self.design.delete(id) {
+        crate::editor::delete_selection(&mut self.design, &self.selected_ids);
+        if self.design.element(id).is_none() {
             self.selected = self.design.elements.last().map(|element| element.id);
+            self.selected_ids = self.selected.into_iter().collect();
             self.set_status("Layer deleted", false);
         }
     }
@@ -1782,6 +2939,176 @@ impl ButtonStudio {
         if self.design.move_layer(id, toward_front) {
             self.history.record(previous);
             self.set_status("Layer order updated", false);
+        }
+    }
+
+    fn move_selected_to_edge(&mut self, toward_front: bool) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let Some(index) = self
+            .design
+            .elements
+            .iter()
+            .position(|element| element.id == id)
+        else {
+            return;
+        };
+        let edge = if toward_front {
+            self.design.elements.len().saturating_sub(1)
+        } else {
+            0
+        };
+        if index == edge {
+            return;
+        }
+        let previous = self.design.clone();
+        let element = self.design.elements.remove(index);
+        let insert_at = if toward_front {
+            self.design.elements.len()
+        } else {
+            0
+        };
+        self.design.elements.insert(insert_at, element);
+        self.history.record(previous);
+        self.set_status(
+            if toward_front {
+                "Layer brought to front"
+            } else {
+                "Layer sent to back"
+            },
+            false,
+        );
+    }
+
+    fn toggle_group(&mut self, ungroup: bool) {
+        if self.selected_ids.len() < 2 {
+            return;
+        }
+        let previous = self.design.clone();
+        if ungroup {
+            crate::editor::ungroup(&mut self.design, &self.selected_ids);
+        } else {
+            crate::editor::group(&mut self.design, &self.selected_ids);
+        }
+        self.history.record(previous);
+        self.set_status(
+            if ungroup {
+                "Objects ungrouped"
+            } else {
+                "Objects grouped"
+            },
+            false,
+        );
+    }
+
+    fn bulk_transform(&mut self, rotate: bool, positive: bool) {
+        let previous = self.design.clone();
+        let changed = if rotate {
+            crate::editor::rotate_selection(
+                &mut self.design,
+                &self.selected_ids,
+                if positive { 15.0 } else { -15.0 },
+            )
+        } else {
+            crate::editor::scale_selection(
+                &mut self.design,
+                &self.selected_ids,
+                if positive { 1.1 } else { 0.9 },
+            )
+        };
+        if changed {
+            self.history.record(previous);
+        }
+    }
+
+    fn copy_selected(&mut self) {
+        self.clipboard = crate::editor::selection_ids(&self.design, &self.selected_ids)
+            .into_iter()
+            .filter_map(|id| self.design.element(id).cloned())
+            .collect();
+        self.clipboard_assets.clear();
+        for element in &self.clipboard {
+            if let ElementKind::Image { asset_id, .. } = &element.kind
+                && let Some(asset) = self.design.assets.get(asset_id)
+            {
+                self.clipboard_assets
+                    .insert(asset_id.clone(), asset.clone());
+            }
+        }
+    }
+
+    fn paste_clipboard(&mut self, context: &egui::Context) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        let previous = self.design.clone();
+        let ids = crate::editor::paste_elements(
+            &mut self.design,
+            &self.clipboard,
+            &self.clipboard_assets,
+        );
+        self.history.record(previous);
+        self.selected = ids.last().copied();
+        self.selected_ids = ids;
+        self.reload_textures(context);
+        self.set_status("Pasted objects", false);
+    }
+
+    fn paste_style(&mut self) {
+        let Some(source) = self.clipboard.first() else {
+            return;
+        };
+        let previous = self.design.clone();
+        let targets = crate::editor::selection_ids(&self.design, &self.selected_ids);
+        let mut changed = false;
+        for target_id in targets {
+            if let Some(target) = self
+                .design
+                .element_mut(target_id)
+                .filter(|target| !target.locked)
+            {
+                target.color = source.color;
+                target.opacity = source.opacity;
+                target.appearance = source.appearance.clone();
+                changed = true;
+            }
+        }
+        if changed {
+            self.history.record(previous);
+        }
+    }
+
+    fn select_hit(&mut self, hit: Option<u64>, additive: bool) {
+        let members = hit
+            .map(|id| crate::editor::selection_ids(&self.design, &[id]))
+            .unwrap_or_default();
+        if additive {
+            if !members.is_empty() && members.iter().all(|id| self.selected_ids.contains(id)) {
+                self.selected_ids.retain(|id| !members.contains(id));
+            } else {
+                for id in members {
+                    if !self.selected_ids.contains(&id) {
+                        self.selected_ids.push(id);
+                    }
+                }
+            }
+            self.selected = self.selected_ids.last().copied();
+        } else {
+            self.selected = hit;
+            self.selected_ids = members;
+        }
+    }
+
+    fn sync_selection_ids(&mut self) {
+        self.selected_ids
+            .retain(|id| self.design.element(*id).is_some());
+        match self.selected {
+            Some(id) if !self.selected_ids.contains(&id) => {
+                self.selected_ids = crate::editor::selection_ids(&self.design, &[id])
+            }
+            None => self.selected_ids.clear(),
+            _ => {}
         }
     }
 
@@ -1816,12 +3143,29 @@ impl eframe::App for ButtonStudio {
         self.open_external_project(ui.ctx());
         self.sync_from_document(ui.ctx());
         self.apply_pending_updates(ui.ctx());
+        self.sync_selection_ids();
         self.handle_shortcuts(ui.ctx());
+        if self
+            .design
+            .assets
+            .keys()
+            .any(|id| !self.textures.contains_key(id))
+            || self
+                .textures
+                .keys()
+                .any(|id| !self.design.assets.contains_key(id))
+        {
+            self.reload_textures(ui.ctx());
+        }
         self.top_bar(ui);
         self.tool_panel(ui);
         self.right_panel(ui);
         self.canvas(ui);
         self.font_browser(ui.ctx());
+        self.library_window(ui.ctx());
+        self.export_review_window(ui.ctx());
+        self.help_window(ui.ctx());
+        self.clear_confirmation(ui.ctx());
         self.publish_to_document();
     }
 }
@@ -1848,6 +3192,101 @@ fn top_icon_button(ui: &mut Ui, icon_name: &str, tooltip: &str, enabled: bool) -
         .min_size(vec2(34.0, 34.0)),
     )
     .on_hover_text(tooltip)
+}
+
+fn export_kind_label(kind: ExportKind) -> &'static str {
+    match kind {
+        ExportKind::Png => "Transparent PNG",
+        ExportKind::PdfSheet => "A4 print sheet PDF",
+        ExportKind::PdfSeries => "Personalized series PDF",
+        ExportKind::Svg => "SVG",
+    }
+}
+
+fn series_signature(series: &SeriesData) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    series.source_name.hash(&mut hasher);
+    series.columns.hash(&mut hasher);
+    series.rows.len().hash(&mut hasher);
+    for row in &series.rows {
+        for column in &series.columns {
+            column.hash(&mut hasher);
+            row.get(column).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn show_preflight_issue(ui: &mut Ui, issue: &PreflightIssue) {
+    let color = match issue.severity {
+        IssueSeverity::Error => Color32::from_rgb(178, 63, 52),
+        IssueSeverity::Warning => Color32::from_rgb(171, 105, 32),
+    };
+    ui.colored_label(
+        color,
+        format!("{} · {}", issue.code.replace('_', " "), issue.message),
+    );
+}
+
+fn format_row_numbers(rows: &[usize]) -> String {
+    let list = rows
+        .iter()
+        .take(12)
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if rows.len() > 12 {
+        format!("{list}, … (+{} more)", rows.len() - 12)
+    } else {
+        list
+    }
+}
+
+fn safe_file_stem(name: &str) -> String {
+    let mut stem = name
+        .chars()
+        .filter_map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                Some(ch)
+            } else if ch == ' ' || ch == '-' || ch == '_' {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .take(64)
+        .collect::<String>();
+    while stem.contains("--") {
+        stem = stem.replace("--", "-");
+    }
+    let stem = stem.trim_matches('-');
+    if stem.is_empty() {
+        "button-template".into()
+    } else {
+        stem.into()
+    }
+}
+
+fn design_palette(design: &Design) -> Vec<DesignColor> {
+    let mut colors = vec![design.background];
+    for element in &design.elements {
+        for color in [
+            Some(element.color),
+            element.appearance.fill,
+            element.appearance.outline,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !colors.contains(&color) {
+                colors.push(color);
+            }
+            if colors.len() >= 32 {
+                return colors;
+            }
+        }
+    }
+    colors
 }
 
 fn section_label(text: &str) -> RichText {
@@ -2017,6 +3456,52 @@ fn align_element(
     true
 }
 
+fn align_selection(
+    design: &mut Design,
+    painter: &egui::Painter,
+    ids: &[u64],
+    reference: Option<u64>,
+    alignment: ElementAlignment,
+) -> bool {
+    const R: f32 = 1000.0;
+    let center = egui::Pos2::ZERO;
+    let ids = crate::editor::selection_ids(design, ids);
+    let mut bounds = ids
+        .iter()
+        .filter_map(|id| design.element(*id))
+        .filter(|e| !e.locked)
+        .map(|e| element_bounds(painter, center, R, e));
+    let Some(first) = bounds.next() else {
+        return false;
+    };
+    let source = bounds.fold(first, |a, b| a.union(b));
+    if let Some(reference_id) = reference.filter(|id| design.element(*id).is_some()) {
+        let reference = design.element(reference_id).unwrap();
+        let target = element_bounds(painter, center, R, reference);
+        let mut changed = false;
+        for id in ids {
+            if id == reference_id {
+                continue;
+            }
+            if let Some(e) = design.element_mut(id).filter(|e| !e.locked) {
+                let delta =
+                    alignment_delta(element_bounds(painter, center, R, e), target, alignment) / R;
+                e.position[0] += delta.x;
+                e.position[1] += delta.y;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+    let target = egui::Rect::from_center_size(center, Vec2::splat(R * 2.0));
+    let delta = alignment_delta(source, target, alignment) / R;
+    if delta == Vec2::ZERO {
+        return false;
+    }
+    crate::editor::move_selection(design, &ids, [delta.x, delta.y]);
+    true
+}
+
 fn alignment_delta(source: egui::Rect, target: egui::Rect, alignment: ElementAlignment) -> Vec2 {
     match alignment {
         ElementAlignment::Left => vec2(target.left() - source.left(), 0.0),
@@ -2064,6 +3549,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
     output
 }
 
+#[cfg(test)]
 fn clamp_element_position(position: &mut [f32; 2]) {
     let length = (position[0].powi(2) + position[1].powi(2)).sqrt();
     if length > ELEMENT_POSITION_LIMIT {
@@ -2198,3 +3684,7 @@ mod tests {
         assert_eq!(matching_fonts(&available, "missing").len(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "app_workflow_tests.rs"]
+mod workflow_tests;
