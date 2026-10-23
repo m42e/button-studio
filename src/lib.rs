@@ -4,5 +4,6 @@ pub mod fonts;
 pub mod model;
 pub mod render;
 pub mod series;
+pub mod svg_import;
 pub mod text_raster;
 pub mod theme;
