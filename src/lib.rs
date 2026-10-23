@@ -1,9 +1,14 @@
 pub mod app;
+pub mod appearance;
 pub mod document;
+pub mod editor;
 pub mod fonts;
 pub mod model;
+pub mod production;
 pub mod render;
 pub mod series;
+pub mod svg;
 pub mod svg_import;
+pub mod templates;
 pub mod text_raster;
 pub mod theme;

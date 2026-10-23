@@ -1,3 +1,4 @@
+use crate::appearance::ImageFit;
 use crate::model::{
     BackgroundStyle, Design, DesignColor, Element, ElementKind, ShapeKind, TextFont,
 };
@@ -21,8 +22,8 @@ use std::{cell::RefCell, collections::HashMap, fs, io::Cursor, path::Path};
 
 const EXPORT_DPI: f32 = 300.0;
 const EXPORT_SUPERSAMPLE: u32 = 2;
-const A4_WIDTH_MM: f32 = 210.0;
-const A4_HEIGHT_MM: f32 = 297.0;
+pub(crate) const A4_WIDTH_MM: f32 = 210.0;
+pub(crate) const A4_HEIGHT_MM: f32 = 297.0;
 const PDF_MARGIN_MM: f32 = 5.0;
 const PDF_BUTTON_GAP_MM: f32 = 2.0;
 
@@ -269,12 +270,16 @@ pub fn selection_bounds(
 }
 
 pub fn element_bounds(
-    painter: &egui::Painter,
+    _painter: &egui::Painter,
     center: Pos2,
     radius: f32,
     element: &Element,
 ) -> Rect {
-    let bounds = unrotated_element_bounds(painter, center, radius, element);
+    element_bounds_at(center, radius, element)
+}
+
+fn element_bounds_at(center: Pos2, radius: f32, element: &Element) -> Rect {
+    let bounds = unrotated_element_bounds(center, radius, element);
     if element.rotation.abs() <= f32::EPSILON {
         return bounds;
     }
@@ -287,12 +292,21 @@ pub fn element_bounds(
     ])
 }
 
-fn unrotated_element_bounds(
-    _painter: &egui::Painter,
-    center: Pos2,
-    radius: f32,
-    element: &Element,
-) -> Rect {
+/// Element bounds in artwork-radius units, measured using the same text and shape metrics as the renderer.
+pub fn normalized_element_bounds(element: &Element) -> Rect {
+    let radius = 1000.0;
+    let bounds = element_bounds_at(egui::pos2(0.0, 0.0), radius, element);
+    let outline_pad = match &element.kind {
+        ElementKind::Text { .. } => 0.0, // text raster bounds already include the dilated outline
+        ElementKind::Shape { .. } | ElementKind::Image { .. } => {
+            element.appearance.outline_width.max(0.0)
+        }
+        ElementKind::QrCode { .. } => 0.0,
+    };
+    Rect::from_min_max(bounds.min / radius, bounds.max / radius).expand(outline_pad)
+}
+
+fn unrotated_element_bounds(center: Pos2, radius: f32, element: &Element) -> Rect {
     let element_center = center + vec2(element.position[0], element.position[1]) * radius;
     match &element.kind {
         ElementKind::Text {
@@ -304,11 +318,27 @@ fn unrotated_element_bounds(
             let scale = radius * 2.0 * *font_size;
             let color = Rgba([255, 255, 255, 255]);
             let composed = if curvature.abs() <= f32::EPSILON {
-                compose_straight_text(text, scale, font, color)
+                compose_straight_text(
+                    text,
+                    scale,
+                    font,
+                    color,
+                    element.appearance.line_spacing,
+                    element.appearance.letter_spacing,
+                    element.appearance.text_alignment,
+                )
             } else {
                 compose_curved_text(text, scale, font, *curvature, color)
             };
-            match composed {
+            match composed.map(|(image, origin)| {
+                apply_text_outline(
+                    image,
+                    origin,
+                    element.appearance.outline,
+                    element.appearance.outline_width * radius * 2.0,
+                    255,
+                )
+            }) {
                 Some((image, origin)) => Rect::from_min_size(
                     element_center - origin,
                     vec2(image.width() as f32, image.height() as f32),
@@ -335,11 +365,19 @@ fn unrotated_element_bounds(
             ..
         } => {
             let width = radius * 2.0 * width;
-            let height = if *bleed_to_square {
-                width
+            let frame_aspect = if *bleed_to_square {
+                1.0
             } else {
-                width / aspect_ratio
-            };
+                element.appearance.image_frame_aspect.unwrap_or_else(|| {
+                    if element.appearance.image_fit == ImageFit::Cover {
+                        1.0
+                    } else {
+                        *aspect_ratio
+                    }
+                })
+            }
+            .max(0.01);
+            let height = width / frame_aspect;
             Rect::from_center_size(element_center, vec2(width, height))
         }
         ElementKind::QrCode { size, .. } => {
@@ -481,7 +519,7 @@ pub fn export_pdf_series(
     })
 }
 
-fn pdf_sheet_layout(artwork_diameter_mm: f32) -> Vec<[f32; 2]> {
+pub(crate) fn pdf_sheet_layout(artwork_diameter_mm: f32) -> Vec<[f32; 2]> {
     let available_width = A4_WIDTH_MM - PDF_MARGIN_MM * 2.0;
     let available_height = A4_HEIGHT_MM - PDF_MARGIN_MM * 2.0;
     let stride = artwork_diameter_mm + PDF_BUTTON_GAP_MM;
@@ -526,7 +564,7 @@ pub fn render_preview_image(design: &Design, output_size: u32) -> Result<egui::C
     ))
 }
 
-fn render_trimmed_badge(
+pub(crate) fn render_trimmed_badge(
     design: &Design,
     output_size: u32,
     supersample: u32,
@@ -702,6 +740,34 @@ fn cover_uv_radii(aspect_ratio: f32) -> (f32, f32) {
     }
 }
 
+fn image_crop_uv(source_aspect: f32, frame_aspect: f32, pan: [f32; 2]) -> ([f32; 2], [f32; 2]) {
+    let relative_aspect = source_aspect.max(0.01) / frame_aspect.max(0.01);
+    let (uw, vh) = if relative_aspect >= 1.0 {
+        (1.0 / relative_aspect, 1.0)
+    } else {
+        (1.0, relative_aspect)
+    };
+    let cx = (0.5 + pan[0].clamp(-1.0, 1.0) * (1.0 - uw) * 0.5).clamp(uw * 0.5, 1.0 - uw * 0.5);
+    let cy = (0.5 + pan[1].clamp(-1.0, 1.0) * (1.0 - vh) * 0.5).clamp(vh * 0.5, 1.0 - vh * 0.5);
+    (
+        [cx - uw * 0.5, cx + uw * 0.5],
+        [cy - vh * 0.5, cy + vh * 0.5],
+    )
+}
+
+fn flip_point(point: Pos2, center: Pos2, x: bool, y: bool) -> Pos2 {
+    pos2(
+        if x { 2.0 * center.x - point.x } else { point.x },
+        if y { 2.0 * center.y - point.y } else { point.y },
+    )
+}
+
+fn flip_points(points: &mut [Pos2], center: Pos2, x: bool, y: bool) {
+    for point in points {
+        *point = flip_point(*point, center, x, y);
+    }
+}
+
 fn paint_element(
     painter: &egui::Painter,
     center: Pos2,
@@ -726,8 +792,16 @@ fn paint_element(
                 text,
                 scale,
                 font,
-                *curvature,
                 raster_color,
+                TextRasterStyle {
+                    curvature: *curvature,
+                    line_spacing: element.appearance.line_spacing,
+                    letter_spacing: element.appearance.letter_spacing,
+                    alignment: element.appearance.text_alignment,
+                    outline: element.appearance.outline,
+                    outline_width: element.appearance.outline_width * radius * 2.0 * ppp,
+                    opacity: element.opacity,
+                },
                 ppp,
             ) {
                 let rect = Rect::from_min_size(position - origin, size);
@@ -750,34 +824,59 @@ fn paint_element(
             let (width, height) = shape_dimensions(*shape, *size, *width, *height);
             let radius_x = radius * width;
             let radius_y = radius * height;
+            let mut outline_color = element.appearance.outline.unwrap_or(element.color);
+            outline_color.alpha =
+                ((outline_color.alpha as u16 * element.opacity as u16) / 255) as u8;
+            let outline = Color32::from(outline_color);
+            let outline_width = element.appearance.outline_width.max(0.0) * radius * 2.0;
+            let transform = |corner| ShapeTransform {
+                center: position,
+                rx: radius_x,
+                ry: radius_y,
+                rotation: element.rotation,
+                flip_x: element.flip_x,
+                flip_y: element.flip_y,
+                corner,
+            };
             match shape {
                 ShapeKind::Circle => {
-                    if (radius_x - radius_y).abs() < f32::EPSILON {
-                        painter.circle_filled(position, radius_x, color);
-                    } else {
-                        let points = ellipse_points(position, radius_x, radius_y, element.rotation);
-                        painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
+                    let points = transformed_shape_points(*shape, transform(0.0));
+                    painter.add(Shape::convex_polygon(points.clone(), color, Stroke::NONE));
+                    if outline_width > 0.0 {
+                        painter.add(Shape::closed_line(
+                            points,
+                            Stroke::new(outline_width, outline),
+                        ));
                     }
                 }
                 ShapeKind::Star => {
-                    let points = rotated_shape_points_xy(
-                        *shape,
-                        position,
-                        radius_x,
-                        radius_y,
-                        element.rotation,
-                    );
+                    let points = transformed_shape_points(*shape, transform(0.0));
                     paint_polygon_fan(painter, position, &points, color);
+                    if outline_width > 0.0 {
+                        painter.add(Shape::closed_line(
+                            points,
+                            Stroke::new(outline_width, outline),
+                        ));
+                    }
                 }
                 _ => {
-                    let points = rotated_shape_points_xy(
+                    let points = transformed_shape_points(
                         *shape,
-                        position,
-                        radius_x,
-                        radius_y,
-                        element.rotation,
+                        transform(if *shape == ShapeKind::Rectangle {
+                            (radius * 2.0 * element.appearance.corner_radius)
+                                .min(radius_x)
+                                .min(radius_y)
+                        } else {
+                            0.0
+                        }),
                     );
-                    painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
+                    painter.add(Shape::convex_polygon(points.clone(), color, Stroke::NONE));
+                    if outline_width > 0.0 {
+                        painter.add(Shape::closed_line(
+                            points,
+                            Stroke::new(outline_width, outline),
+                        ));
+                    }
                 }
             }
         }
@@ -787,28 +886,82 @@ fn paint_element(
             bleed_to_square,
             ..
         } => {
-            let bounds = unrotated_element_bounds(painter, center, radius, element);
+            let bounds = unrotated_element_bounds(center, radius, element);
             if let Some(texture) = textures.get(asset_id) {
                 let tint = Color32::WHITE.gamma_multiply(element.opacity as f32 / 255.0);
-                if *bleed_to_square {
+                if element.appearance.image_fit == ImageFit::Cover {
+                    let frame_aspect = element.appearance.image_frame_aspect.unwrap_or(1.0);
+                    let (u, v) =
+                        image_crop_uv(*aspect_ratio, frame_aspect, element.appearance.crop_pan);
+                    paint_rotated_image_uv_flipped(
+                        painter,
+                        texture.id(),
+                        bounds,
+                        position,
+                        element.rotation,
+                        Rect::from_min_max(pos2(u[0], v[0]), pos2(u[1], v[1])),
+                        tint,
+                        element.flip_x,
+                        element.flip_y,
+                    );
+                } else if *bleed_to_square {
                     paint_edge_bleed_image(
                         painter,
                         texture.id(),
                         bounds,
+                        *aspect_ratio,
+                        ImagePaintStyle {
+                            center: position,
+                            rotation: element.rotation,
+                            color: tint,
+                            flip_x: element.flip_x,
+                            flip_y: element.flip_y,
+                        },
+                    );
+                } else if let Some(frame_aspect) = element.appearance.image_frame_aspect {
+                    let source_aspect = aspect_ratio.max(0.01);
+                    let frame_aspect = frame_aspect.max(0.01);
+                    let fit_size = if source_aspect >= frame_aspect {
+                        vec2(bounds.width(), bounds.width() / source_aspect)
+                    } else {
+                        vec2(bounds.height() * source_aspect, bounds.height())
+                    };
+                    let fitted = Rect::from_center_size(position, fit_size);
+                    paint_rotated_image_uv_flipped(
+                        painter,
+                        texture.id(),
+                        fitted,
                         position,
                         element.rotation,
-                        *aspect_ratio,
+                        Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
                         tint,
+                        element.flip_x,
+                        element.flip_y,
                     );
                 } else {
-                    paint_rotated_image(
+                    paint_rotated_image_uv_flipped(
                         painter,
                         texture.id(),
                         bounds,
                         position,
                         element.rotation,
+                        Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
                         tint,
+                        element.flip_x,
+                        element.flip_y,
                     );
+                }
+                if element.appearance.outline_width > 0.0 {
+                    let border = rgba_design(
+                        element.appearance.outline.unwrap_or(element.color),
+                        element.opacity,
+                    );
+                    let border =
+                        Color32::from_rgba_unmultiplied(border[0], border[1], border[2], border[3]);
+                    painter.add(Shape::closed_line(
+                        rotated_rect_points(bounds, position, element.rotation),
+                        Stroke::new(element.appearance.outline_width * radius * 2.0, border),
+                    ));
                 }
             } else {
                 let points = rotated_rect_points(bounds, position, element.rotation);
@@ -833,7 +986,7 @@ fn paint_element(
                 .then(|| Color32::from(*background).gamma_multiply(element.opacity as f32 / 255.0));
             paint_qr_code(
                 painter,
-                unrotated_element_bounds(painter, center, radius, element),
+                unrotated_element_bounds(center, radius, element),
                 content,
                 color,
                 background,
@@ -862,59 +1015,94 @@ fn paint_rotated_image(
     );
 }
 
+#[derive(Clone, Copy)]
+struct ImagePaintStyle {
+    center: Pos2,
+    rotation: f32,
+    color: Color32,
+    flip_x: bool,
+    flip_y: bool,
+}
+
 fn paint_edge_bleed_image(
     painter: &egui::Painter,
     texture_id: egui::TextureId,
     bounds: Rect,
-    center: Pos2,
-    rotation: f32,
     aspect_ratio: f32,
-    color: Color32,
+    style: ImagePaintStyle,
 ) {
     let aspect_ratio = aspect_ratio.max(0.01);
     if aspect_ratio >= 1.0 {
         let image_height = bounds.height() / aspect_ratio;
-        let image_bounds = Rect::from_center_size(center, vec2(bounds.width(), image_height));
-        paint_rotated_image_uv(
+        let image_bounds = Rect::from_center_size(style.center, vec2(bounds.width(), image_height));
+        paint_rotated_image_uv_flipped(
             painter,
             texture_id,
             Rect::from_min_max(bounds.min, image_bounds.right_top()),
-            center,
-            rotation,
+            style.center,
+            style.rotation,
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 0.0)),
-            color,
+            style.color,
+            style.flip_x,
+            style.flip_y,
         );
-        paint_rotated_image(painter, texture_id, image_bounds, center, rotation, color);
-        paint_rotated_image_uv(
+        paint_rotated_image_uv_flipped(
+            painter,
+            texture_id,
+            image_bounds,
+            style.center,
+            style.rotation,
+            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+            style.color,
+            style.flip_x,
+            style.flip_y,
+        );
+        paint_rotated_image_uv_flipped(
             painter,
             texture_id,
             Rect::from_min_max(image_bounds.left_bottom(), bounds.max),
-            center,
-            rotation,
+            style.center,
+            style.rotation,
             Rect::from_min_max(pos2(0.0, 1.0), pos2(1.0, 1.0)),
-            color,
+            style.color,
+            style.flip_x,
+            style.flip_y,
         );
     } else {
         let image_width = bounds.width() * aspect_ratio;
-        let image_bounds = Rect::from_center_size(center, vec2(image_width, bounds.height()));
-        paint_rotated_image_uv(
+        let image_bounds = Rect::from_center_size(style.center, vec2(image_width, bounds.height()));
+        paint_rotated_image_uv_flipped(
             painter,
             texture_id,
             Rect::from_min_max(bounds.min, image_bounds.left_bottom()),
-            center,
-            rotation,
+            style.center,
+            style.rotation,
             Rect::from_min_max(pos2(0.0, 0.0), pos2(0.0, 1.0)),
-            color,
+            style.color,
+            style.flip_x,
+            style.flip_y,
         );
-        paint_rotated_image(painter, texture_id, image_bounds, center, rotation, color);
-        paint_rotated_image_uv(
+        paint_rotated_image_uv_flipped(
+            painter,
+            texture_id,
+            image_bounds,
+            style.center,
+            style.rotation,
+            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+            style.color,
+            style.flip_x,
+            style.flip_y,
+        );
+        paint_rotated_image_uv_flipped(
             painter,
             texture_id,
             Rect::from_min_max(image_bounds.right_top(), bounds.max),
-            center,
-            rotation,
+            style.center,
+            style.rotation,
             Rect::from_min_max(pos2(1.0, 0.0), pos2(1.0, 1.0)),
-            color,
+            style.color,
+            style.flip_x,
+            style.flip_y,
         );
     }
 }
@@ -928,6 +1116,32 @@ fn paint_rotated_image_uv(
     uv_bounds: Rect,
     color: Color32,
 ) {
+    paint_rotated_image_uv_flipped(
+        painter, texture_id, bounds, center, rotation, uv_bounds, color, false, false,
+    );
+}
+
+// Keeping each geometric input explicit makes UV mirroring and rotated quad
+// placement auditable at the call sites; this helper intentionally exceeds the
+// generic argument-count threshold.
+#[allow(clippy::too_many_arguments)]
+fn paint_rotated_image_uv_flipped(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    bounds: Rect,
+    center: Pos2,
+    rotation: f32,
+    mut uv_bounds: Rect,
+    color: Color32,
+    flip_x: bool,
+    flip_y: bool,
+) {
+    if flip_x {
+        std::mem::swap(&mut uv_bounds.min.x, &mut uv_bounds.max.x);
+    }
+    if flip_y {
+        std::mem::swap(&mut uv_bounds.min.y, &mut uv_bounds.max.y);
+    }
     let points = rotated_rect_points(bounds, center, rotation);
     let mut mesh = Mesh::with_texture(texture_id);
     for (pos, uv) in points.into_iter().zip([
@@ -1018,7 +1232,7 @@ thread_local! {
 }
 
 fn element_rgba(element: &Element) -> Rgba<u8> {
-    let mut color = element.color;
+    let mut color = element.appearance.fill.unwrap_or(element.color);
     color.alpha = ((color.alpha as u16 * element.opacity as u16) / 255) as u8;
     rgba(color)
 }
@@ -1031,10 +1245,54 @@ fn compose_straight_text(
     scale: f32,
     font: &TextFont,
     color: Rgba<u8>,
+    line_spacing: f32,
+    letter_spacing: f32,
+    alignment: crate::appearance::TextAlignment,
 ) -> Option<(RgbaImage, Vec2)> {
-    let image = crate::text_raster::render_line(text, scale, font, color)?;
+    let image = crate::text_raster::render_line_styled(
+        text,
+        scale,
+        font,
+        color,
+        line_spacing,
+        letter_spacing,
+        alignment,
+    )?;
     let origin = vec2(image.width() as f32 / 2.0, image.height() as f32 / 2.0);
     Some((image, origin))
+}
+
+fn apply_text_outline(
+    image: RgbaImage,
+    origin: Vec2,
+    color: Option<DesignColor>,
+    width: f32,
+    opacity: u8,
+) -> (RgbaImage, Vec2) {
+    let Some(color) = color else {
+        return (image, origin);
+    };
+    let radius = width.ceil().clamp(0.0, 255.0) as i32;
+    if radius == 0 {
+        return (image, origin);
+    }
+    let pad = radius as u32;
+    let mut mask = image::GrayImage::new(image.width() + pad * 2, image.height() + pad * 2);
+    for (x, y, pixel) in image.enumerate_pixels() {
+        mask.put_pixel(x + pad, y + pad, image::Luma([pixel[3]]));
+    }
+    let dilated =
+        imageproc::morphology::dilate(&mask, imageproc::distance_transform::Norm::L2, radius as u8);
+    let mut output = RgbaImage::new(image.width() + pad * 2, image.height() + pad * 2);
+    let alpha = ((color.alpha as u16 * opacity as u16) / 255) as u8;
+    let ink = Rgba([color.red, color.green, color.blue, alpha]);
+    for (x, y, pixel) in output.enumerate_pixels_mut() {
+        if dilated.get_pixel(x, y)[0] > 0 {
+            *pixel = ink;
+        }
+    }
+    imageops::overlay(&mut output, &image, pad as i64, pad as i64);
+    (output, origin + Vec2::splat(pad as f32))
 }
 
 /// Rasterizes curved text into an RGBA image through the shared export pipeline.
@@ -1099,13 +1357,24 @@ fn compose_curved_text(
 /// pixel-for-pixel (including where glyphs fall relative to the trim edge).
 /// Returns the texture id, its logical size, and the logical origin that maps to
 /// the element position.
+#[derive(Clone, Copy)]
+struct TextRasterStyle {
+    curvature: f32,
+    line_spacing: f32,
+    letter_spacing: f32,
+    alignment: crate::appearance::TextAlignment,
+    outline: Option<DesignColor>,
+    outline_width: f32,
+    opacity: u8,
+}
+
 fn text_texture(
     ctx: &egui::Context,
     text: &str,
     scale: f32,
     font: &TextFont,
-    curvature: f32,
     color: Rgba<u8>,
+    style: TextRasterStyle,
     pixels_per_point: f32,
 ) -> Option<(egui::TextureId, Vec2, Vec2)> {
     use std::hash::{Hash, Hasher};
@@ -1114,18 +1383,39 @@ fn text_texture(
     text.hash(&mut hasher);
     font.registration_key().hash(&mut hasher);
     scale.to_bits().hash(&mut hasher);
-    curvature.to_bits().hash(&mut hasher);
+    style.curvature.to_bits().hash(&mut hasher);
     color.0.hash(&mut hasher);
+    style.line_spacing.to_bits().hash(&mut hasher);
+    style.letter_spacing.to_bits().hash(&mut hasher);
+    style.alignment.hash(&mut hasher);
+    style.outline.hash(&mut hasher);
+    style.outline_width.to_bits().hash(&mut hasher);
+    style.opacity.hash(&mut hasher);
     let key = hasher.finish();
 
     TEXT_TEXTURES.with(|cache| {
         let mut cache = cache.borrow_mut();
         if !cache.contains_key(&key) {
-            let (image, origin) = if curvature.abs() <= f32::EPSILON {
-                compose_straight_text(text, scale, font, color)
+            let (image, origin) = if style.curvature.abs() <= f32::EPSILON {
+                compose_straight_text(
+                    text,
+                    scale,
+                    font,
+                    color,
+                    style.line_spacing,
+                    style.letter_spacing,
+                    style.alignment,
+                )
             } else {
-                compose_curved_text(text, scale, font, curvature, color)
+                compose_curved_text(text, scale, font, style.curvature, color)
             }?;
+            let (image, origin) = apply_text_outline(
+                image,
+                origin,
+                style.outline,
+                style.outline_width,
+                style.opacity,
+            );
             let dimensions = [image.width() as usize, image.height() as usize];
             let color_image = ColorImage::from_rgba_unmultiplied(dimensions, image.as_raw());
             let handle = ctx.load_texture(
@@ -1207,11 +1497,6 @@ fn paint_polygon_fan(painter: &egui::Painter, center: Pos2, points: &[Pos2], col
     painter.add(Shape::mesh(mesh));
 }
 
-#[cfg(test)]
-fn shape_points(kind: ShapeKind, center: Pos2, radius: f32) -> Vec<Pos2> {
-    shape_points_xy(kind, center, radius, radius)
-}
-
 fn shape_points_xy(kind: ShapeKind, center: Pos2, radius_x: f32, radius_y: f32) -> Vec<Pos2> {
     match kind {
         ShapeKind::Star => (0..10)
@@ -1269,32 +1554,6 @@ fn shape_points_xy(kind: ShapeKind, center: Pos2, radius_x: f32, radius_y: f32) 
             })
             .collect(),
     }
-}
-
-fn rotated_shape_points_xy(
-    kind: ShapeKind,
-    center: Pos2,
-    radius_x: f32,
-    radius_y: f32,
-    rotation: f32,
-) -> Vec<Pos2> {
-    shape_points_xy(kind, center, radius_x, radius_y)
-        .into_iter()
-        .map(|point| rotate_point(point, center, rotation))
-        .collect()
-}
-
-fn ellipse_points(center: Pos2, radius_x: f32, radius_y: f32, rotation: f32) -> Vec<Pos2> {
-    (0..48)
-        .map(|index| {
-            let angle = index as f32 * std::f32::consts::TAU / 48.0;
-            rotate_point(
-                center + vec2(angle.cos() * radius_x, angle.sin() * radius_y),
-                center,
-                rotation,
-            )
-        })
-        .collect()
 }
 
 fn shape_dimensions(
@@ -1502,7 +1761,7 @@ fn raster_element_unrotated(
 ) -> Result<(), String> {
     let x = center + element.position[0] * radius;
     let y = center + element.position[1] * radius;
-    let mut color = element.color;
+    let mut color = element.appearance.fill.unwrap_or(element.color);
     color.alpha = ((color.alpha as u16 * element.opacity as u16) / 255) as u8;
 
     match &element.kind {
@@ -1514,7 +1773,23 @@ fn raster_element_unrotated(
         } => {
             let scale = radius * 2.0 * font_size;
             if curvature.abs() <= f32::EPSILON {
-                raster_centered_text(canvas, pos2(x, y), text, scale, font, rgba(color));
+                raster_centered_text(
+                    canvas,
+                    pos2(x, y),
+                    text,
+                    scale,
+                    font,
+                    rgba(color),
+                    TextRasterStyle {
+                        curvature: *curvature,
+                        line_spacing: element.appearance.line_spacing,
+                        letter_spacing: element.appearance.letter_spacing,
+                        alignment: element.appearance.text_alignment,
+                        outline: element.appearance.outline,
+                        outline_width: element.appearance.outline_width * radius * 2.0,
+                        opacity: element.opacity,
+                    },
+                );
             } else {
                 raster_curved_text(
                     canvas,
@@ -1522,8 +1797,16 @@ fn raster_element_unrotated(
                     text,
                     scale,
                     font,
-                    *curvature,
                     rgba(color),
+                    TextRasterStyle {
+                        curvature: *curvature,
+                        line_spacing: element.appearance.line_spacing,
+                        letter_spacing: element.appearance.letter_spacing,
+                        alignment: element.appearance.text_alignment,
+                        outline: element.appearance.outline,
+                        outline_width: element.appearance.outline_width * radius * 2.0,
+                        opacity: element.opacity,
+                    },
                 );
             }
         }
@@ -1534,11 +1817,58 @@ fn raster_element_unrotated(
             height,
         } => {
             let (width, height) = shape_dimensions(*shape, *size, *width, *height);
-            let points = shape_points_xy(*shape, pos2(x, y), radius * width, radius * height)
+            let shape_points =
+                if *shape == ShapeKind::Rectangle && element.appearance.corner_radius > 0.0 {
+                    rounded_rect_points(
+                        pos2(x, y),
+                        radius * width,
+                        radius * height,
+                        (radius * 2.0 * element.appearance.corner_radius)
+                            .min(radius * width)
+                            .min(radius * height),
+                    )
+                } else {
+                    shape_points_xy(*shape, pos2(x, y), radius * width, radius * height)
+                };
+            let mut points = shape_points
                 .into_iter()
                 .map(|point| Point::new(point.x as i32, point.y as i32))
                 .collect::<Vec<_>>();
+            for point in &mut points {
+                if element.flip_x {
+                    point.x = (2.0 * x - point.x as f32).round() as i32;
+                }
+                if element.flip_y {
+                    point.y = (2.0 * y - point.y as f32).round() as i32;
+                }
+            }
             draw_polygon_mut(canvas, &points, rgba(color));
+            if element.appearance.outline_width > 0.0 {
+                let outline = rgba_design(
+                    element.appearance.outline.unwrap_or(element.color),
+                    element.opacity,
+                );
+                let thickness = (element.appearance.outline_width * radius * 2.0)
+                    .round()
+                    .max(1.0) as i32;
+                for index in 0..points.len() {
+                    let a = points[index];
+                    let b = points[(index + 1) % points.len()];
+                    let dx = b.x as f32 - a.x as f32;
+                    let dy = b.y as f32 - a.y as f32;
+                    let length = (dx * dx + dy * dy).sqrt().max(1.0);
+                    let (nx, ny) = (-dy / length, dx / length);
+                    for step in 0..thickness {
+                        let offset = step as f32 - (thickness - 1) as f32 / 2.0;
+                        draw_line_segment_mut(
+                            canvas,
+                            (a.x as f32 + nx * offset, a.y as f32 + ny * offset),
+                            (b.x as f32 + nx * offset, b.y as f32 + ny * offset),
+                            outline,
+                        );
+                    }
+                }
+            }
         }
         ElementKind::Image {
             asset_id,
@@ -1548,26 +1878,99 @@ fn raster_element_unrotated(
         } => {
             let source = decoded_asset(design, decoded_assets, asset_id)?;
             let target_width = (radius * 2.0 * width).max(1.0) as u32;
-            let mut resized = if *bleed_to_square {
-                edge_bleed_square(source, target_width, *aspect_ratio)
+            let frame_aspect = if *bleed_to_square {
+                1.0
             } else {
-                let target_height = (target_width as f32 / aspect_ratio).max(1.0) as u32;
-                imageops::resize(
+                element.appearance.image_frame_aspect.unwrap_or_else(|| {
+                    if element.appearance.image_fit == ImageFit::Cover {
+                        1.0
+                    } else {
+                        *aspect_ratio
+                    }
+                })
+            }
+            .max(0.01);
+            let target_height = (target_width as f32 / frame_aspect).max(1.0).round() as u32;
+            let mut resized = if element.appearance.image_fit == ImageFit::Cover {
+                let (u, v) =
+                    image_crop_uv(*aspect_ratio, frame_aspect, element.appearance.crop_pan);
+                let left = (u[0] * source.width() as f32).floor() as u32;
+                let top = (v[0] * source.height() as f32).floor() as u32;
+                let sw = ((u[1] - u[0]) * source.width() as f32).round().max(1.0) as u32;
+                let sh = ((v[1] - v[0]) * source.height() as f32).round().max(1.0) as u32;
+                let crop = imageops::crop_imm(
                     source,
+                    left.min(source.width() - 1),
+                    top.min(source.height() - 1),
+                    sw.min(source.width() - left.min(source.width() - 1)).max(1),
+                    sh.min(source.height() - top.min(source.height() - 1))
+                        .max(1),
+                )
+                .to_image();
+                imageops::resize(
+                    &crop,
                     target_width,
                     target_height,
+                    imageops::FilterType::Lanczos3,
+                )
+            } else if *bleed_to_square {
+                edge_bleed_square(source, target_width, *aspect_ratio)
+            } else {
+                let (fit_width, fit_height) = if element.appearance.image_frame_aspect.is_some() {
+                    let scale = (target_width as f32 / source.width() as f32)
+                        .min(target_height as f32 / source.height() as f32);
+                    (
+                        (source.width() as f32 * scale).round().max(1.0) as u32,
+                        (source.height() as f32 * scale).round().max(1.0) as u32,
+                    )
+                } else {
+                    (
+                        target_width,
+                        (target_width as f32 / aspect_ratio).max(1.0).round() as u32,
+                    )
+                };
+                imageops::resize(
+                    source,
+                    fit_width,
+                    fit_height,
                     imageops::FilterType::Lanczos3,
                 )
             };
             for pixel in resized.pixels_mut() {
                 pixel[3] = ((pixel[3] as u16 * element.opacity as u16) / 255) as u8;
             }
+            if element.flip_x {
+                imageops::flip_horizontal_in_place(&mut resized);
+            }
+            if element.flip_y {
+                imageops::flip_vertical_in_place(&mut resized);
+            }
             imageops::overlay(
                 canvas,
                 &resized,
-                (x - target_width as f32 / 2.0) as i64,
+                (x - resized.width() as f32 / 2.0) as i64,
                 (y - resized.height() as f32 / 2.0) as i64,
             );
+            if element.appearance.outline_width > 0.0 {
+                let thickness = (element.appearance.outline_width * radius * 2.0)
+                    .round()
+                    .max(1.0) as i32;
+                let left = x - target_width as f32 / 2.0;
+                let top = y - target_height as f32 / 2.0;
+                let right = left + target_width as f32;
+                let bottom = top + target_height as f32;
+                let border = rgba_design(
+                    element.appearance.outline.unwrap_or(element.color),
+                    element.opacity,
+                );
+                for offset in 0..thickness {
+                    let d = offset as f32 - (thickness - 1) as f32 / 2.0;
+                    draw_line_segment_mut(canvas, (left, top + d), (right, top + d), border);
+                    draw_line_segment_mut(canvas, (left, bottom + d), (right, bottom + d), border);
+                    draw_line_segment_mut(canvas, (left + d, top), (left + d, bottom), border);
+                    draw_line_segment_mut(canvas, (right + d, top), (right + d, bottom), border);
+                }
+            }
         }
         ElementKind::QrCode {
             content,
@@ -1637,10 +2040,26 @@ fn raster_centered_text(
     scale: f32,
     font: &TextFont,
     color: Rgba<u8>,
+    style: TextRasterStyle,
 ) {
-    let Some((image, origin)) = compose_straight_text(text, scale, font, color) else {
+    let Some((image, origin)) = compose_straight_text(
+        text,
+        scale,
+        font,
+        color,
+        style.line_spacing,
+        style.letter_spacing,
+        style.alignment,
+    ) else {
         return;
     };
+    let (image, origin) = apply_text_outline(
+        image,
+        origin,
+        style.outline,
+        style.outline_width,
+        style.opacity,
+    );
     imageops::overlay(
         canvas,
         &image,
@@ -1722,12 +2141,20 @@ fn raster_curved_text(
     text: &str,
     scale: f32,
     font: &TextFont,
-    curvature: f32,
     color: Rgba<u8>,
+    style: TextRasterStyle,
 ) {
-    let Some((image, origin)) = compose_curved_text(text, scale, font, curvature, color) else {
+    let Some((image, origin)) = compose_curved_text(text, scale, font, style.curvature, color)
+    else {
         return;
     };
+    let (image, origin) = apply_text_outline(
+        image,
+        origin,
+        style.outline,
+        style.outline_width,
+        style.opacity,
+    );
     imageops::overlay(
         canvas,
         &image,
@@ -1737,9 +2164,66 @@ fn raster_curved_text(
 }
 
 fn element_color(element: &Element) -> Color32 {
-    let mut color = element.color;
+    let mut color = element.appearance.fill.unwrap_or(element.color);
     color.alpha = ((color.alpha as u16 * element.opacity as u16) / 255) as u8;
     color.into()
+}
+
+fn rounded_rect_points(center: Pos2, rx: f32, ry: f32, corner: f32) -> Vec<Pos2> {
+    let cr = corner.max(0.0).min(rx).min(ry);
+    let mut points = Vec::with_capacity(20);
+    for (cx, cy, start) in [
+        (
+            center.x + rx - cr,
+            center.y - ry + cr,
+            -std::f32::consts::FRAC_PI_2,
+        ),
+        (center.x + rx - cr, center.y + ry - cr, 0.0),
+        (
+            center.x - rx + cr,
+            center.y + ry - cr,
+            std::f32::consts::FRAC_PI_2,
+        ),
+        (center.x - rx + cr, center.y - ry + cr, std::f32::consts::PI),
+    ] {
+        for step in 0..=4 {
+            let angle = start + step as f32 * std::f32::consts::FRAC_PI_2 / 4.0;
+            points.push(pos2(cx + cr * angle.cos(), cy + cr * angle.sin()));
+        }
+    }
+    points
+}
+
+struct ShapeTransform {
+    center: Pos2,
+    rx: f32,
+    ry: f32,
+    rotation: f32,
+    flip_x: bool,
+    flip_y: bool,
+    corner: f32,
+}
+
+fn transformed_shape_points(kind: ShapeKind, transform: ShapeTransform) -> Vec<Pos2> {
+    let ShapeTransform {
+        center,
+        rx,
+        ry,
+        rotation,
+        flip_x,
+        flip_y,
+        corner,
+    } = transform;
+    let mut points = if kind == ShapeKind::Rectangle && corner > 0.0 {
+        rounded_rect_points(center, rx, ry, corner)
+    } else {
+        shape_points_xy(kind, center, rx, ry)
+    };
+    flip_points(&mut points, center, flip_x, flip_y);
+    points
+        .into_iter()
+        .map(|point| rotate_point(point, center, rotation))
+        .collect()
 }
 
 fn mix_color(from: Color32, to: Color32, amount: f32) -> Color32 {
@@ -1764,6 +2248,15 @@ fn lerp(from: u8, to: u8, amount: f32) -> u8 {
 
 fn rgba(color: DesignColor) -> Rgba<u8> {
     Rgba([color.red, color.green, color.blue, color.alpha])
+}
+
+fn rgba_design(color: DesignColor, opacity: u8) -> Rgba<u8> {
+    Rgba([
+        color.red,
+        color.green,
+        color.blue,
+        ((color.alpha as u16 * opacity as u16) / 255) as u8,
+    ])
 }
 
 fn confetti_positions() -> &'static [(f32, f32)] {
@@ -1801,6 +2294,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn crop_pan_shifts_cover_window_without_changing_its_size() {
+        let (u0, v0) = image_crop_uv(2.0, 1.0, [-1.0, 0.0]);
+        let (u1, v1) = image_crop_uv(2.0, 1.0, [1.0, 0.0]);
+        assert!((u0[1] - u0[0] - 0.5).abs() < f32::EPSILON);
+        assert!(u0[0] < u1[0]);
+        assert_eq!(v0, [0.0, 1.0]);
+        assert_eq!(v1, [0.0, 1.0]);
+    }
+
+    #[test]
+    fn image_cover_pan_and_flip_change_pixels_while_contain_preserves_source_ratio() {
+        let source = RgbaImage::from_fn(4, 2, |x, _| {
+            if x < 2 {
+                Rgba([240, 20, 20, 255])
+            } else {
+                Rgba([20, 20, 240, 255])
+            }
+        });
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(source)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let mut design = Design::default();
+        design.background_style = BackgroundStyle::None;
+        design.elements.clear();
+        let (asset, aspect) = design.import_asset(bytes.into_inner(), None).unwrap();
+        let id = design.add_image(asset, aspect);
+        let image = design.element_mut(id).unwrap();
+        image.position = [0.0, 0.0];
+        image.appearance.image_fit = ImageFit::Cover;
+        image.appearance.image_frame_aspect = Some(1.0);
+        image.appearance.crop_pan = [-1.0, 0.0];
+        let left = render_trimmed_badge(&design, 200, 1)
+            .unwrap()
+            .get_pixel(100, 100)
+            .to_owned();
+        design.elements[0].appearance.crop_pan = [1.0, 0.0];
+        let right = render_trimmed_badge(&design, 200, 1)
+            .unwrap()
+            .get_pixel(100, 100)
+            .to_owned();
+        assert!(left[0] > left[2]);
+        assert!(right[2] > right[0]);
+        design.elements[0].appearance.image_fit = ImageFit::Contain;
+        design.elements[0].appearance.image_frame_aspect = Some(1.5);
+        design.elements[0].flip_x = false;
+        let contained = render_trimmed_badge(&design, 200, 1).unwrap();
+        assert_eq!(
+            contained.get_pixel(100, 70)[3],
+            0,
+            "contain keeps the source aspect inside a 3:2 frame"
+        );
+        assert!(contained.get_pixel(100, 100)[3] > 0);
+        design.elements[0].appearance.image_fit = ImageFit::Cover;
+        design.elements[0].appearance.image_frame_aspect = Some(1.0);
+        design.elements[0].appearance.crop_pan = [0.0, 0.0];
+        design.elements[0].flip_x = true;
+        let flipped = render_trimmed_badge(&design, 200, 1).unwrap();
+        assert!(flipped.get_pixel(75, 100)[0] < flipped.get_pixel(125, 100)[0]);
+    }
+
+    #[test]
+    fn raster_uses_appearance_fill_and_outline_for_shapes() {
+        let mut design = Design::default();
+        design.background_style = BackgroundStyle::None;
+        let element = &mut design.elements[0];
+        element.position = [0.0, 0.0];
+        element.kind = ElementKind::Shape {
+            shape: ShapeKind::Rectangle,
+            size: 0.35,
+            width: None,
+            height: None,
+        };
+        element.appearance.fill = Some(DesignColor::rgb(220, 10, 20));
+        element.appearance.outline = Some(DesignColor::rgb(10, 20, 230));
+        element.appearance.outline_width = 0.01;
+        element.appearance.corner_radius = 0.08;
+        let image = render_trimmed_badge(&design, 160, 1).unwrap();
+        let center = image.get_pixel(80, 80);
+        assert!(center[0] > center[2]);
+        assert!(image.pixels().any(|p| p[2] > p[0]));
+    }
+
+    #[test]
+    fn text_outline_respects_opacity_and_grows_with_physical_scale() {
+        let glyph = RgbaImage::from_pixel(3, 3, Rgba([255, 255, 255, 255]));
+        let (outlined, origin) = apply_text_outline(
+            glyph,
+            vec2(1.5, 1.5),
+            Some(DesignColor::rgb(255, 0, 0)),
+            2.0,
+            128,
+        );
+        assert_eq!(outlined.dimensions(), (7, 7));
+        assert_eq!(origin, vec2(3.5, 3.5));
+        assert_eq!(outlined.get_pixel(0, 3), &Rgba([255, 0, 0, 128]));
+        assert_eq!(outlined.get_pixel(3, 3), &Rgba([255, 255, 255, 255]));
+        let narrow = (0.01_f32 * 2.0 * 100.0).round() as u32;
+        let broad = (0.01_f32 * 2.0 * 200.0).round() as u32;
+        assert_eq!(broad, narrow * 2);
+    }
+
+    #[test]
     fn edge_bleed_square_repeats_outer_rows() {
         let source = RgbaImage::from_fn(2, 1, |x, _| {
             if x == 0 {
@@ -1821,11 +2417,12 @@ mod tests {
 
     #[test]
     fn rectangle_shape_has_three_to_two_aspect_ratio() {
-        let points = shape_points(ShapeKind::Rectangle, Pos2::ZERO, 30.0);
-        let bounds = Rect::from_two_pos(points[0], points[2]);
+        let (width, height) = shape_dimensions(ShapeKind::Rectangle, 30.0, None, None);
+        let points = shape_points_xy(ShapeKind::Rectangle, Pos2::ZERO, width, height);
+        let bounds = Rect::from_points(&points);
 
         assert_eq!(points.len(), 4);
-        assert!((bounds.width() / bounds.height() - 1.5).abs() < f32::EPSILON);
+        assert!((bounds.width() / bounds.height() - 1.5).abs() < 1e-6);
     }
 
     #[test]
@@ -1879,7 +2476,8 @@ mod tests {
         let layout = pdf_sheet_layout(diameter);
 
         assert_eq!(layout.len(), 8);
-        assert!((layout[1][0] - layout[0][0] - diameter - PDF_BUTTON_GAP_MM).abs() < f32::EPSILON);
+        assert!((layout[0][0] + diameter / 2.0 - A4_WIDTH_MM * 0.25).abs() < 1e-5);
+        assert!((layout[1][0] + diameter / 2.0 - A4_WIDTH_MM * 0.75).abs() < 1e-5);
         assert!((layout[2][1] - layout[0][1] - diameter - PDF_BUTTON_GAP_MM).abs() < f32::EPSILON);
         for [x, y] in layout {
             assert!(x >= PDF_MARGIN_MM);
@@ -1956,6 +2554,8 @@ mod tests {
             element.kind = ElementKind::Shape {
                 shape: ShapeKind::Diamond,
                 size: 0.3,
+                width: None,
+                height: None,
             };
         }
 
@@ -2000,6 +2600,15 @@ mod tests {
             32.0,
             &TextFont::default(),
             Rgba([255, 255, 255, 255]),
+            TextRasterStyle {
+                curvature: 0.0,
+                line_spacing: 1.0,
+                letter_spacing: 0.0,
+                alignment: crate::appearance::TextAlignment::Center,
+                outline: None,
+                outline_width: 0.0,
+                opacity: 255,
+            },
         );
 
         let (left, top, right, bottom) = alpha_bounds(&canvas).expect("visible text pixels");

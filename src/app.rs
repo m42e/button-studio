@@ -2114,6 +2114,8 @@ mod tests {
         let mut shape = ElementKind::Shape {
             shape: ShapeKind::Star,
             size: 0.2,
+            width: None,
+            height: None,
         };
         let mut image = ElementKind::Image {
             asset_id: "asset".to_owned(),

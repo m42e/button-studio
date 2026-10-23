@@ -1,3 +1,4 @@
+use crate::appearance::Appearance;
 use eframe::egui::Color32;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -7,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const PROJECT_VERSION: u32 = 9;
+pub const PROJECT_VERSION: u32 = 10;
 pub const ELEMENT_POSITION_LIMIT: f32 = 1.0;
 pub const IMAGE_WIDTH_LIMIT: f32 = 4.0;
 const HISTORY_LIMIT: usize = 80;
@@ -42,7 +43,7 @@ mod base64_bytes {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DesignColor {
     pub red: u8,
     pub green: u8,
@@ -229,6 +230,18 @@ pub struct BackgroundImage {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Element {
     pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_override: Option<String>,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<u64>,
+    #[serde(default)]
+    pub flip_x: bool,
+    #[serde(default)]
+    pub flip_y: bool,
+    #[serde(default)]
+    pub appearance: Appearance,
     pub position: [f32; 2],
     #[serde(default)]
     pub rotation: f32,
@@ -240,6 +253,9 @@ pub struct Element {
 
 impl Element {
     pub fn name(&self) -> String {
+        if let Some(name) = &self.name_override {
+            return name.clone();
+        }
         match &self.kind {
             ElementKind::Text { text, .. } => text.clone(),
             ElementKind::Shape { shape, .. } => shape.label().to_owned(),
@@ -277,6 +293,12 @@ impl Default for Design {
             elements: vec![
                 Element {
                     id: 1,
+                    name_override: None,
+                    locked: false,
+                    group_id: None,
+                    flip_x: false,
+                    flip_y: false,
+                    appearance: Appearance::default(),
                     position: [0.0, -0.18],
                     rotation: 0.0,
                     color: DesignColor::rgb(255, 207, 77),
@@ -291,6 +313,12 @@ impl Default for Design {
                 },
                 Element {
                     id: 2,
+                    name_override: None,
+                    locked: false,
+                    group_id: None,
+                    flip_x: false,
+                    flip_y: false,
+                    appearance: Appearance::default(),
                     position: [0.0, 0.2],
                     rotation: 0.0,
                     color: DesignColor::WHITE,
@@ -345,6 +373,12 @@ impl Design {
         let id = self.take_id();
         self.elements.push(Element {
             id,
+            appearance: Appearance::default(),
+            name_override: None,
+            locked: false,
+            group_id: None,
+            flip_x: false,
+            flip_y: false,
             position: [0.0, 0.0],
             rotation: 0.0,
             color: DesignColor::WHITE,
@@ -360,10 +394,24 @@ impl Design {
         id
     }
 
+    /// Inserts a project-local clipboard object while allocating a fresh stable ID.
+    pub fn insert_element(&mut self, mut element: Element) -> u64 {
+        let id = self.take_id();
+        element.id = id;
+        self.elements.push(element);
+        id
+    }
+
     pub fn add_shape(&mut self, shape: ShapeKind) -> u64 {
         let id = self.take_id();
         self.elements.push(Element {
             id,
+            appearance: Appearance::default(),
+            name_override: None,
+            locked: false,
+            group_id: None,
+            flip_x: false,
+            flip_y: false,
             position: [0.0, 0.0],
             rotation: 0.0,
             color: DesignColor::rgb(255, 207, 77),
@@ -408,6 +456,12 @@ impl Design {
         let id = self.take_id();
         self.elements.push(Element {
             id,
+            appearance: Appearance::default(),
+            name_override: None,
+            locked: false,
+            group_id: None,
+            flip_x: false,
+            flip_y: false,
             position: [0.0, 0.0],
             rotation: 0.0,
             color: DesignColor::WHITE,
@@ -427,6 +481,12 @@ impl Design {
         let id = self.take_id();
         self.elements.push(Element {
             id,
+            appearance: Appearance::default(),
+            name_override: None,
+            locked: false,
+            group_id: None,
+            flip_x: false,
+            flip_y: false,
             position: [0.0, 0.0],
             rotation: 0.0,
             color: DesignColor::INK,
@@ -488,6 +548,30 @@ impl Design {
         true
     }
 
+    pub fn reorder_layer(&mut self, source_id: u64, target_id: u64) -> bool {
+        let Some(source) = self
+            .elements
+            .iter()
+            .position(|element| element.id == source_id)
+        else {
+            return false;
+        };
+        let Some(target) = self
+            .elements
+            .iter()
+            .position(|element| element.id == target_id)
+        else {
+            return false;
+        };
+        if source == target {
+            return false;
+        }
+        let element = self.elements.remove(source);
+        self.elements
+            .insert(target.min(self.elements.len()), element);
+        true
+    }
+
     pub fn element(&self, id: u64) -> Option<&Element> {
         self.elements.iter().find(|element| element.id == id)
     }
@@ -503,6 +587,13 @@ impl Design {
         }
         self.elements.truncate(200);
         for element in &mut self.elements {
+            element.appearance.normalize();
+            if let Some(name) = &mut element.name_override {
+                name.truncate(80);
+                if name.trim().is_empty() {
+                    element.name_override = None;
+                }
+            }
             element.position[0] =
                 element.position[0].clamp(-ELEMENT_POSITION_LIMIT, ELEMENT_POSITION_LIMIT);
             element.position[1] =
@@ -549,6 +640,26 @@ impl Design {
                     content.truncate(2_048);
                     *size = size.clamp(0.08, 1.2);
                 }
+            }
+        }
+        let valid_group_ids: HashSet<u64> = self
+            .elements
+            .iter()
+            .filter_map(|element| element.group_id)
+            .filter(|group| {
+                self.elements
+                    .iter()
+                    .filter(|element| element.group_id == Some(*group))
+                    .count()
+                    > 1
+            })
+            .collect();
+        for element in &mut self.elements {
+            if element
+                .group_id
+                .is_some_and(|group| !valid_group_ids.contains(&group))
+            {
+                element.group_id = None;
             }
         }
         if let Some(background_image) = &mut self.background_image {
@@ -809,6 +920,62 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_element_json_defaults_appearance_and_editing_metadata() {
+        let element = Element {
+            id: 12,
+            name_override: None,
+            locked: false,
+            group_id: None,
+            flip_x: false,
+            flip_y: false,
+            appearance: Appearance::default(),
+            position: [0.0, 0.0],
+            rotation: 0.0,
+            color: DesignColor::WHITE,
+            opacity: 255,
+            visible: true,
+            kind: ElementKind::Text {
+                text: "Old".into(),
+                font_size: 0.1,
+                font: TextFont::default(),
+                curvature: 0.0,
+            },
+        };
+        let mut value = serde_json::to_value(&element).unwrap();
+        for key in [
+            "appearance",
+            "name_override",
+            "locked",
+            "group_id",
+            "flip_x",
+            "flip_y",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        let restored: Element = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.appearance, Appearance::default());
+        assert!(!restored.locked && !restored.flip_x && !restored.flip_y);
+    }
+
+    #[test]
+    fn invalid_appearance_values_are_clamped_on_load() {
+        let mut design = Design::default();
+        let appearance = &mut design.elements[0].appearance;
+        appearance.outline_width = f32::NAN;
+        appearance.corner_radius = 2.0;
+        appearance.line_spacing = f32::INFINITY;
+        appearance.letter_spacing = -200.0;
+        appearance.crop_pan = [f32::NAN, 4.0];
+        design.normalize_after_load();
+        let appearance = &design.elements[0].appearance;
+        assert_eq!(appearance.outline_width, 0.0);
+        assert_eq!(appearance.corner_radius, 0.5);
+        assert_eq!(appearance.line_spacing, 1.0);
+        assert_eq!(appearance.letter_spacing, -50.0);
+        assert_eq!(appearance.crop_pan, [0.0, 1.0]);
+    }
 
     fn test_png(color: [u8; 4]) -> Vec<u8> {
         let image = image::RgbaImage::from_pixel(2, 1, image::Rgba(color));
