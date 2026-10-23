@@ -203,34 +203,71 @@ pub fn move_selection(design: &mut Design, ids: &[u64], delta: [f32; 2]) {
                 .map(|e| (id, e.position))
         })
         .collect::<Vec<_>>();
-    if movable.is_empty() {
-        return;
-    }
-    let valid = |scale: f32| {
-        movable.iter().all(|(_, p)| {
-            (p[0] + delta[0] * scale).hypot(p[1] + delta[1] * scale) <= ELEMENT_POSITION_LIMIT
-        })
-    };
-    let scale = if valid(1.0) {
-        1.0
-    } else {
-        let (mut lo, mut hi) = (0.0, 1.0);
-        for _ in 0..24 {
-            let mid = (lo + hi) * 0.5;
-            if valid(mid) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        lo * (1.0 - 1e-6)
-    };
+    let scale = movement_scale(&movable, delta);
     for (id, _) in movable {
         if let Some(el) = design.element_mut(id) {
             el.position[0] += delta[0] * scale;
             el.position[1] += delta[1] * scale;
         }
     }
+}
+
+/// Place a dragged selection from its original pointer-down positions. This
+/// keeps snap corrections from accumulating across pointer events.
+pub fn move_selection_from_snapshot(
+    design: &mut Design,
+    snapshot: &[Element],
+    delta: [f32; 2],
+) -> bool {
+    let movable = snapshot
+        .iter()
+        .filter_map(|original| {
+            design
+                .element(original.id)
+                .filter(|element| !element.locked)
+                .map(|_| (original.id, original.position))
+        })
+        .collect::<Vec<_>>();
+    if movable.is_empty() {
+        return false;
+    }
+
+    let scale = movement_scale(&movable, delta);
+    for (id, position) in movable {
+        if let Some(element) = design.element_mut(id) {
+            element.position = [
+                position[0] + delta[0] * scale,
+                position[1] + delta[1] * scale,
+            ];
+        }
+    }
+    true
+}
+
+fn movement_scale(movable: &[(u64, [f32; 2])], delta: [f32; 2]) -> f32 {
+    if movable.is_empty() {
+        return 0.0;
+    }
+    let valid = |scale: f32| {
+        movable.iter().all(|(_, position)| {
+            (position[0] + delta[0] * scale).hypot(position[1] + delta[1] * scale)
+                <= ELEMENT_POSITION_LIMIT
+        })
+    };
+    if valid(1.0) {
+        return 1.0;
+    }
+
+    let (mut low, mut high) = (0.0, 1.0);
+    for _ in 0..24 {
+        let middle = (low + high) * 0.5;
+        if valid(middle) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    low * (1.0 - 1e-6)
 }
 
 pub fn duplicate_selection(design: &mut Design, ids: &[u64]) -> Vec<u64> {

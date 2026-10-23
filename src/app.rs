@@ -77,6 +77,7 @@ struct ExportPreflightCache {
 enum CanvasInteraction {
     Move {
         id: u64,
+        start_pointer: egui::Pos2,
     },
     Resize {
         id: u64,
@@ -110,7 +111,7 @@ enum ElementAlignment {
 impl CanvasInteraction {
     fn id(self) -> u64 {
         match self {
-            Self::Move { id }
+            Self::Move { id, .. }
             | Self::Resize { id, .. }
             | Self::ResizeShape { id, .. }
             | Self::ResizeSelection { id, .. } => id,
@@ -179,6 +180,7 @@ pub struct ButtonStudio {
     show_guides: bool,
     canvas_interaction: Option<CanvasInteraction>,
     resize_snapshot: Vec<Element>,
+    move_snapshot: Vec<Element>,
     marquee_start: Option<egui::Pos2>,
     font_catalog: FontCatalog,
     font_search: String,
@@ -256,6 +258,7 @@ impl ButtonStudio {
             show_guides: true,
             canvas_interaction: None,
             resize_snapshot: Vec::new(),
+            move_snapshot: Vec::new(),
             marquee_start: None,
             font_catalog,
             font_search: String::new(),
@@ -749,8 +752,14 @@ impl ButtonStudio {
                             })
                         };
                         let interaction = resize.or_else(|| {
-                            hit_test(&painter, pointer, center, radius, &self.design)
-                                .map(|id| CanvasInteraction::Move { id })
+                            hit_test(&painter, pointer, center, radius, &self.design).map(|id| {
+                                CanvasInteraction::Move {
+                                    id,
+                                    start_pointer: ui
+                                        .input(|input| input.pointer.press_origin())
+                                        .unwrap_or(pointer),
+                                }
+                            })
                         });
                         if interaction.is_none() {
                             self.marquee_start = Some(pointer);
@@ -761,6 +770,12 @@ impl ButtonStudio {
                             if !self.selected_ids.contains(&interaction.id()) {
                                 self.selected_ids =
                                     crate::editor::selection_ids(&self.design, &[interaction.id()]);
+                            }
+                            if matches!(interaction, CanvasInteraction::Move { .. }) {
+                                self.move_snapshot = crate::editor::resize_snapshot(
+                                    &self.design,
+                                    &self.selected_ids,
+                                );
                             }
                             self.canvas_interaction = Some(interaction);
                             self.tool = Tool::Select;
@@ -795,101 +810,109 @@ impl ButtonStudio {
                                     );
                                 }
                             }
-                            Some(CanvasInteraction::Move { id }) => {
-                                let delta = ui.input(|input| input.pointer.delta()) / radius;
-                                let ids = if self.selected_ids.contains(&id) {
-                                    self.selected_ids.clone()
-                                } else {
-                                    vec![id]
-                                };
-                                crate::editor::move_selection(
-                                    &mut self.design,
-                                    &ids,
-                                    [delta.x, delta.y],
-                                );
-                                if self.snapping_enabled {
-                                    let bounds = self
-                                        .selected_ids
-                                        .iter()
-                                        .filter(|sid| ids.contains(sid))
-                                        .filter_map(|sid| self.design.element(*sid))
-                                        .map(|e| selection_bounds(&painter, center, radius, e))
-                                        .reduce(|a, b| a.union(b));
-                                    if let Some(bounds) = bounds {
-                                        let nx = [
-                                            (bounds.left() - center.x) / radius,
-                                            (bounds.center().x - center.x) / radius,
-                                            (bounds.right() - center.x) / radius,
-                                        ];
-                                        let ny = [
-                                            (bounds.top() - center.y) / radius,
-                                            (bounds.center().y - center.y) / radius,
-                                            (bounds.bottom() - center.y) / radius,
-                                        ];
-                                        let trim = self.design.trim_ratio();
-                                        let safe = (self.design.diameter_mm as f32 - 4.0).max(0.0)
-                                            / self.design.artwork_diameter_mm();
-                                        let mut xs =
-                                            vec![-1.0, 0.0, 1.0, -trim, 0.0, trim, -safe, safe];
-                                        let mut ys = xs.clone();
-                                        for other in self.design.elements.iter().filter(|other| {
-                                            other.visible && !ids.contains(&other.id)
-                                        }) {
-                                            let b =
-                                                selection_bounds(&painter, center, radius, other);
-                                            xs.extend([
-                                                (b.left() - center.x) / radius,
-                                                (b.center().x - center.x) / radius,
-                                                (b.right() - center.x) / radius,
-                                            ]);
-                                            ys.extend([
-                                                (b.top() - center.y) / radius,
-                                                (b.center().y - center.y) / radius,
-                                                (b.bottom() - center.y) / radius,
-                                            ]);
-                                        }
-                                        let sx = crate::editor::snap_bounds_axis(
-                                            nx[0],
-                                            nx[1],
-                                            nx[2],
-                                            &xs,
-                                            SNAP_TOLERANCE_POINTS / radius,
-                                        );
-                                        let sy = crate::editor::snap_bounds_axis(
-                                            ny[0],
-                                            ny[1],
-                                            ny[2],
-                                            &ys,
-                                            SNAP_TOLERANCE_POINTS / radius,
-                                        );
-                                        let correction = [
-                                            sx.map_or(0.0, |(d, _)| d),
-                                            sy.map_or(0.0, |(d, _)| d),
-                                        ];
-                                        crate::editor::move_selection(
-                                            &mut self.design,
-                                            &ids,
-                                            correction,
-                                        );
-                                        if let Some((_, guide)) = sx {
-                                            let x = center.x + guide * radius;
-                                            painter.line_segment(
-                                                [
-                                                    egui::pos2(x, rect.top()),
-                                                    egui::pos2(x, rect.bottom()),
-                                                ],
-                                                Stroke::new(1.0, ACCENT),
+                            Some(CanvasInteraction::Move { id, start_pointer }) => {
+                                if let Some(pointer) = response.interact_pointer_pos() {
+                                    let delta = (pointer - start_pointer) / radius;
+                                    let ids = if self.selected_ids.contains(&id) {
+                                        self.selected_ids.clone()
+                                    } else {
+                                        vec![id]
+                                    };
+                                    crate::editor::move_selection_from_snapshot(
+                                        &mut self.design,
+                                        &self.move_snapshot,
+                                        [delta.x, delta.y],
+                                    );
+                                    let snapping_active = self.snapping_enabled
+                                        && !ui.input(|input| input.modifiers.alt);
+                                    if snapping_active {
+                                        let bounds = self
+                                            .selected_ids
+                                            .iter()
+                                            .filter(|sid| ids.contains(sid))
+                                            .filter_map(|sid| self.design.element(*sid))
+                                            .map(|e| selection_bounds(&painter, center, radius, e))
+                                            .reduce(|a, b| a.union(b));
+                                        if let Some(bounds) = bounds {
+                                            let nx = [
+                                                (bounds.left() - center.x) / radius,
+                                                (bounds.center().x - center.x) / radius,
+                                                (bounds.right() - center.x) / radius,
+                                            ];
+                                            let ny = [
+                                                (bounds.top() - center.y) / radius,
+                                                (bounds.center().y - center.y) / radius,
+                                                (bounds.bottom() - center.y) / radius,
+                                            ];
+                                            let trim = self.design.trim_ratio();
+                                            let safe = (self.design.diameter_mm as f32 - 4.0)
+                                                .max(0.0)
+                                                / self.design.artwork_diameter_mm();
+                                            let mut xs =
+                                                vec![-1.0, 0.0, 1.0, -trim, 0.0, trim, -safe, safe];
+                                            let mut ys = xs.clone();
+                                            for other in
+                                                self.design.elements.iter().filter(|other| {
+                                                    other.visible && !ids.contains(&other.id)
+                                                })
+                                            {
+                                                let b = selection_bounds(
+                                                    &painter, center, radius, other,
+                                                );
+                                                xs.extend([
+                                                    (b.left() - center.x) / radius,
+                                                    (b.center().x - center.x) / radius,
+                                                    (b.right() - center.x) / radius,
+                                                ]);
+                                                ys.extend([
+                                                    (b.top() - center.y) / radius,
+                                                    (b.center().y - center.y) / radius,
+                                                    (b.bottom() - center.y) / radius,
+                                                ]);
+                                            }
+                                            let sx = crate::editor::snap_bounds_axis(
+                                                nx[0],
+                                                nx[1],
+                                                nx[2],
+                                                &xs,
+                                                SNAP_TOLERANCE_POINTS / radius,
                                             );
-                                        }
-                                        if let Some((_, guide)) = sy {
-                                            let y = center.y + guide * radius;
-                                            painter.line_segment(
-                                                [
-                                                    egui::pos2(rect.left(), y),
-                                                    egui::pos2(rect.right(), y),
-                                                ],
-                                                Stroke::new(1.0, ACCENT),
+                                            let sy = crate::editor::snap_bounds_axis(
+                                                ny[0],
+                                                ny[1],
+                                                ny[2],
+                                                &ys,
+                                                SNAP_TOLERANCE_POINTS / radius,
                                             );
+                                            let correction = [
+                                                sx.map_or(0.0, |(d, _)| d),
+                                                sy.map_or(0.0, |(d, _)| d),
+                                            ];
+                                            crate::editor::move_selection(
+                                                &mut self.design,
+                                                &ids,
+                                                correction,
+                                            );
+                                            if let Some((_, guide)) = sx {
+                                                let x = center.x + guide * radius;
+                                                painter.line_segment(
+                                                    [
+                                                        egui::pos2(x, rect.top()),
+                                                        egui::pos2(x, rect.bottom()),
+                                                    ],
+                                                    Stroke::new(1.0, ACCENT),
+                                                );
+                                            }
+                                            if let Some((_, guide)) = sy {
+                                                let y = center.y + guide * radius;
+                                                painter.line_segment(
+                                                    [
+                                                        egui::pos2(rect.left(), y),
+                                                        egui::pos2(rect.right(), y),
+                                                    ],
+                                                    Stroke::new(1.0, ACCENT),
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -976,6 +999,7 @@ impl ButtonStudio {
                     if !ui.input(|input| input.pointer.primary_down()) {
                         self.canvas_interaction = None;
                         self.resize_snapshot.clear();
+                        self.move_snapshot.clear();
                     }
                     let resize_cursor = response.hover_pos().and_then(|pointer| {
                         if self.selected_ids.len() > 1 {
@@ -1145,7 +1169,10 @@ impl ButtonStudio {
 
             ui.add_space(6.0);
             ui.label(section_label("POSITION"));
-            ui.checkbox(&mut self.snapping_enabled, "Snap while dragging");
+            ui.checkbox(&mut self.snapping_enabled, "Snap while dragging")
+                .on_hover_text(
+                    "Hold Option (Alt on Windows/Linux) while moving to bypass magnetic alignment.",
+                );
             ui.horizontal(|ui| {
                 ui.label("X mm");
                 let mut x_mm = (element.position[0] + 1.0) * artwork_mm * 0.5;
