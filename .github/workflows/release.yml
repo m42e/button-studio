@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ gitea.ref }}
+
+      - name: Check tag matches Cargo package version
+        shell: bash
+        run: |
+          version=$(sed -nE 's/^version = "([^"]+)"$/\1/p' Cargo.toml | head -n 1)
+          expected_tag="v${version}"
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version (expected $expected_tag)." >&2
+            exit 1
+          fi
+
+  build:
+    needs: verify-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux
+          - os: windows-latest
+            artifact: windows
+          - os: macos-latest
+            artifact: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ gitea.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libgtk-3-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxrandr-dev \
+            pkg-config
+
+      - name: Build Linux executable
+        if: runner.os == 'Linux'
+        run: cargo build --locked --release --bin button-studio
+
+      - name: Build Windows executable
+        if: runner.os == 'Windows'
+        run: cargo build --locked --release --bin button-studio
+
+      - name: Build macOS app bundle
+        if: runner.os == 'macOS'
+        run: bash scripts/build-macos-app.sh
+
+      - name: Package Linux release
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p package
+          tar -C target/release -czf "package/button-studio-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" button-studio
+
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Compress-Archive `
+            -Path target/release/button-studio.exe `
+            -DestinationPath "package/button-studio-$env:GITHUB_REF_NAME-windows-x86_64.zip" `
+            -Force
+
+      - name: Package macOS release
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p package
+          ditto -c -k --sequesterRsrc --keepParent \
+            "target/macos/Pincraft Button Studio.app" \
+            "package/button-studio-${GITHUB_REF_NAME}-macos.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact }}
+          path: package/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: akkuman/gitea-release-action@v1
+        with:
+          server_url: ${{ gitea.server_url }}
+          token: ${{ secrets.GITEA_TOKEN }}
+          tag_name: ${{ gitea.ref_name }}
+          name: ${{ gitea.ref_name }}
+          files: |-
+            dist/*

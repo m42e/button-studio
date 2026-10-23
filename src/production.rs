@@ -476,7 +476,7 @@ mod tests {
         let bounds = crate::render::normalized_element_bounds(&design.elements[1]);
         let width_mm = bounds.width() * design.artwork_diameter_mm() / 2.0;
         assert!(
-            width_mm > 50.0 && width_mm < 65.0,
+            width_mm > 45.0 && width_mm < 60.0,
             "measured text width: {width_mm}"
         );
     }

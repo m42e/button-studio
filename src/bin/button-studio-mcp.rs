@@ -494,7 +494,6 @@ impl ButtonStudioServer {
 
 #[tool_handler(
     name = "button-studio",
-    version = "0.1.0",
     instructions = "Create and edit Pincraft Button Studio designs. Object positions are normalized relative to the artwork radius. Call get_design to inspect object IDs and get_snapshot to visually verify changes."
 )]
 impl ServerHandler for ButtonStudioServer {}

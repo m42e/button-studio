@@ -30,6 +30,7 @@ fn test_app() -> ButtonStudio {
         show_guides: true,
         canvas_interaction: None,
         resize_snapshot: Vec::new(),
+        move_snapshot: Vec::new(),
         marquee_start: None,
         font_catalog: FontCatalog::discover(),
         font_search: String::new(),

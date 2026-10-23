@@ -95,6 +95,24 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+CI runs formatting, Clippy, and the test suite on pushes to `main` and pull requests.
+
+## Releases
+
+Prepare a stable `MAJOR.MINOR.PATCH` release from a clean working tree:
+
+```sh
+scripts/release.py 0.1.1
+git push origin main --follow-tags
+```
+
+The release script updates the crate and lockfile versions, commits the change,
+and creates the matching `vMAJOR.MINOR.PATCH` tag. Pushing that commit and tag
+builds macOS, Windows, and Linux release archives and publishes them to the
+repository release. The macOS app archive uses the ad-hoc signing configured by
+the app bundle script. Gitea Actions must be enabled, with runners registered
+for the `ubuntu-latest`, `windows-latest`, and `macos-latest` labels.
+
 ## Shortcuts
 
 | Action | Shortcut |
