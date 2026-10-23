@@ -714,6 +714,16 @@ pub async fn run(server: ButtonStudioServer) -> Result<(), Box<dyn std::error::E
 mod tests {
     use super::*;
 
+    fn temp_dir() -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("button-studio-mcp-{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
     #[test]
     fn blank_design_has_no_objects() {
         let design = blank_design(38);
@@ -798,5 +808,312 @@ mod tests {
         let (design, revision) = document.snapshot().unwrap();
         assert_eq!(revision, 1);
         assert_eq!(design.elements.len(), 1);
+    }
+
+    #[test]
+    fn supported_shape_background_color_and_diameter_values_are_explicit() {
+        for (name, expected) in [
+            ("star", ShapeKind::Star),
+            ("heart", ShapeKind::Heart),
+            ("circle", ShapeKind::Circle),
+            ("rectangle", ShapeKind::Rectangle),
+            ("diamond", ShapeKind::Diamond),
+            ("bolt", ShapeKind::Bolt),
+        ] {
+            assert_eq!(parse_shape(name).unwrap(), expected);
+        }
+        assert!(parse_shape("triangle").is_err());
+
+        for name in ["solid", "none", "sunburst", "confetti", "grid"] {
+            assert!(parse_background_style(name).is_ok());
+        }
+        assert!(parse_background_style("photo").is_err());
+
+        for diameter in [25, 32, 38, 50, 59, 75] {
+            assert!(validate_diameter(diameter).is_ok());
+        }
+        assert!(validate_diameter(40).is_err());
+        assert_eq!(default_diameter(), 59);
+        assert_eq!(default_snapshot_size(), 512);
+        assert_eq!(finite(1.25, "x").unwrap(), 1.25);
+        assert!(finite(f32::NAN, "x").is_err());
+        assert!(parse_color("GG0000").is_err());
+    }
+
+    #[test]
+    fn type_specific_updates_accept_supported_fields_and_reject_mismatches() {
+        let mut design = blank_design(59);
+        let text_id = design.add_text("before".into());
+        let shape_id = design.add_shape(ShapeKind::Circle);
+        let qr_id = design.add_qr_code("before".into());
+        let image_id = design.add_image("asset".into(), 2.0);
+
+        let text = &mut design.element_mut(text_id).unwrap().kind;
+        update_kind(
+            text,
+            Some("after".into()),
+            Some(0.1),
+            None,
+            Some(-0.2),
+            None,
+        )
+        .unwrap();
+        assert!(update_kind(text, None, None, Some(1.0), None, None).is_err());
+        assert!(update_kind(text, None, None, None, None, Some(true)).is_err());
+        assert!(update_kind(text, None, Some(f32::INFINITY), None, None, None).is_err());
+
+        let shape = &mut design.element_mut(shape_id).unwrap().kind;
+        update_kind(shape, None, Some(0.3), None, None, None).unwrap();
+        assert!(update_kind(shape, Some("no".into()), None, None, None, None).is_err());
+        assert!(update_kind(shape, None, None, None, Some(0.2), None).is_err());
+        assert!(update_kind(shape, None, None, Some(0.4), None, None).is_err());
+        assert!(update_kind(shape, None, None, None, None, Some(true)).is_err());
+
+        let image = &mut design.element_mut(image_id).unwrap().kind;
+        update_kind(image, None, None, Some(0.8), None, Some(true)).unwrap();
+        assert!(update_kind(image, Some("no".into()), None, None, None, None).is_err());
+        assert!(update_kind(image, None, Some(0.2), None, None, None).is_err());
+        assert!(update_kind(image, None, None, None, Some(0.2), None).is_err());
+
+        let qr = &mut design.element_mut(qr_id).unwrap().kind;
+        update_kind(qr, Some("after".into()), Some(0.4), None, None, None).unwrap();
+        assert!(update_kind(qr, None, None, Some(0.4), None, None).is_err());
+        assert!(update_kind(qr, None, None, None, Some(0.2), None).is_err());
+        assert!(update_kind(qr, None, None, None, None, Some(true)).is_err());
+    }
+
+    #[test]
+    fn server_supports_project_lifecycle_object_crud_settings_and_exports() {
+        let directory = temp_dir();
+        let server = ButtonStudioServer::default();
+        server
+            .new_design(Parameters(NewDesignParams { diameter_mm: 50 }))
+            .unwrap();
+        assert!(
+            server
+                .new_design(Parameters(NewDesignParams { diameter_mm: 40 }))
+                .is_err()
+        );
+
+        server
+            .add_text(Parameters(AddTextParams {
+                text: "Ada".into(),
+                x: None,
+                y: None,
+                size: None,
+                color: None,
+            }))
+            .unwrap();
+        server
+            .add_shape(Parameters(AddShapeParams {
+                shape: "rectangle".into(),
+                x: Some(0.1),
+                y: Some(-0.1),
+                size: Some(0.25),
+                color: Some("#11223380".into()),
+            }))
+            .unwrap();
+        server
+            .add_qr_code(Parameters(AddQrParams {
+                content: "https://example.com".into(),
+                x: Some(0.0),
+                y: Some(0.0),
+                size: Some(0.3),
+            }))
+            .unwrap();
+
+        let image_path = directory.join("source.png");
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(8, 4)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        fs::write(&image_path, png.into_inner()).unwrap();
+        server
+            .add_image(Parameters(AddImageParams {
+                path: image_path.to_string_lossy().into_owned(),
+                background: false,
+                x: Some(0.05),
+                y: None,
+                width: Some(0.7),
+                bleed_to_square: true,
+            }))
+            .unwrap();
+        server
+            .add_image(Parameters(AddImageParams {
+                path: image_path.to_string_lossy().into_owned(),
+                background: true,
+                x: None,
+                y: None,
+                width: None,
+                bleed_to_square: false,
+            }))
+            .unwrap();
+        assert!(
+            server
+                .add_image(Parameters(AddImageParams {
+                    path: directory.join("missing.png").to_string_lossy().into_owned(),
+                    background: false,
+                    x: None,
+                    y: None,
+                    width: None,
+                    bleed_to_square: false,
+                }))
+                .is_err()
+        );
+
+        server
+            .update_object(Parameters(UpdateObjectParams {
+                id: 1,
+                x: Some(0.2),
+                y: Some(-0.2),
+                rotation: Some(15.0),
+                color: Some("AABBCC".into()),
+                opacity: Some(200),
+                visible: Some(false),
+                content: Some("Grace".into()),
+                size: Some(0.12),
+                width: None,
+                curvature: Some(0.3),
+                bleed_to_square: None,
+            }))
+            .unwrap();
+        server
+            .update_object(Parameters(UpdateObjectParams {
+                id: 999,
+                x: None,
+                y: None,
+                rotation: None,
+                color: None,
+                opacity: None,
+                visible: None,
+                content: None,
+                size: None,
+                width: None,
+                curvature: None,
+                bleed_to_square: None,
+            }))
+            .unwrap_err();
+        assert!(
+            server
+                .update_object(Parameters(UpdateObjectParams {
+                    id: 1,
+                    x: Some(f32::NAN),
+                    y: None,
+                    rotation: None,
+                    color: None,
+                    opacity: None,
+                    visible: None,
+                    content: None,
+                    size: None,
+                    width: None,
+                    curvature: None,
+                    bleed_to_square: None,
+                }))
+                .is_err()
+        );
+
+        server
+            .move_layer(Parameters(LayerParams {
+                id: 1,
+                direction: "front".into(),
+            }))
+            .unwrap();
+        assert!(
+            server
+                .move_layer(Parameters(LayerParams {
+                    id: 1,
+                    direction: "sideways".into(),
+                }))
+                .is_err()
+        );
+        server
+            .set_design(Parameters(DesignSettingsParams {
+                diameter_mm: Some(75),
+                background_color: Some("#123456".into()),
+                background_style: Some("grid".into()),
+                clear_background_image: true,
+            }))
+            .unwrap();
+        assert!(
+            server
+                .set_design(Parameters(DesignSettingsParams {
+                    diameter_mm: None,
+                    background_color: None,
+                    background_style: Some("invalid".into()),
+                    clear_background_image: false,
+                }))
+                .is_err()
+        );
+        server.get_design().unwrap();
+        server
+            .duplicate_object(Parameters(ObjectIdParams { id: 2 }))
+            .unwrap();
+        server
+            .delete_object(Parameters(ObjectIdParams { id: 3 }))
+            .unwrap();
+        assert!(
+            server
+                .delete_object(Parameters(ObjectIdParams { id: u64::MAX }))
+                .is_err()
+        );
+
+        let project_path = directory.join("design.buttonstudio");
+        server
+            .save_project(Parameters(PathParams {
+                path: project_path.to_string_lossy().into_owned(),
+            }))
+            .unwrap();
+        let reopened = ButtonStudioServer::default();
+        reopened
+            .open_project(Parameters(PathParams {
+                path: project_path.to_string_lossy().into_owned(),
+            }))
+            .unwrap();
+        assert!(
+            reopened
+                .open_project(Parameters(PathParams {
+                    path: directory
+                        .join("missing.buttonstudio")
+                        .to_string_lossy()
+                        .into_owned(),
+                }))
+                .is_err()
+        );
+
+        for (format, file) in [
+            ("png", "design.png"),
+            ("pdf", "design.pdf"),
+            ("project", "export.buttonstudio"),
+        ] {
+            reopened
+                .export(Parameters(ExportParams {
+                    path: directory.join(file).to_string_lossy().into_owned(),
+                    format: format.into(),
+                }))
+                .unwrap();
+        }
+        assert!(
+            reopened
+                .export(Parameters(ExportParams {
+                    path: directory.join("bad.out").to_string_lossy().into_owned(),
+                    format: "jpeg".into(),
+                }))
+                .is_err()
+        );
+        assert!(
+            reopened
+                .get_snapshot(Parameters(SnapshotParams { size: 64 }))
+                .is_err()
+        );
+        assert_eq!(
+            reopened
+                .get_snapshot(Parameters(SnapshotParams { size: 128 }))
+                .unwrap()
+                .content
+                .len(),
+            2
+        );
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }
