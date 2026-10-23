@@ -28,6 +28,8 @@ use std::{
     sync::mpsc::{self, Receiver},
 };
 
+const SNAP_TOLERANCE_POINTS: f32 = 6.0;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
     Select,
@@ -851,14 +853,14 @@ impl ButtonStudio {
                                             nx[1],
                                             nx[2],
                                             &xs,
-                                            12.0 / radius,
+                                            SNAP_TOLERANCE_POINTS / radius,
                                         );
                                         let sy = crate::editor::snap_bounds_axis(
                                             ny[0],
                                             ny[1],
                                             ny[2],
                                             &ys,
-                                            12.0 / radius,
+                                            SNAP_TOLERANCE_POINTS / radius,
                                         );
                                         let correction = [
                                             sx.map_or(0.0, |(d, _)| d),
