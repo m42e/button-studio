@@ -8,20 +8,30 @@ quieter desktop layout and a print-oriented export path.
 
 - Round button sizes from 25 mm to 75 mm
 - Drag-to-position text, shape, and image layers
+- Shift-click or drag a marquee to select several objects; move, scale, rotate,
+  duplicate, align, distribute, and group compositions together
+- Numeric position and size in millimeters, proportional sizing, centering, and flips
+- Snap to artwork, trim, safe-area, and object edges and centers with temporary guides
 - Align layers to the artwork page or relative to another layer
 - Proportional resizing from selection corner handles
 - Editable text, color, opacity, size, and visibility
+- Named and locked layers, plus an internal clipboard that carries embedded artwork
+- Text alignment and spacing, shape/text outlines, rounded rectangles, and image crop controls
 - Persistent, searchable Font Browser for installed faces and styles on each text layer
 - Star, heart, circle, diamond, and bolt shapes
 - Solid, sunburst, confetti, grid, and cover-cropped photo backgrounds
 - Layer ordering, duplication, deletion, and visibility controls
 - Bounded undo and redo history
 - Trim-accurate preview plus a single labeled finished-edge guide on the canvas
+- Trim, bleed, and safe-area guides; export review with resolution checks and an A4 placement preview
 - PNG, JPEG, and WebP image import
+- SVG image import (flattened with an explicit notice) and SVG export with fidelity warnings
 - Self-contained, human-readable `.buttonstudio` project save/load
 - Embedded project artwork previews for macOS Finder and Quick Look
 - Transparent PNG export sized at 300 DPI
 - CSV series printing with personalized text and QR variables
+- Series entry ranges, copies, personalized preview, and explicit invalid-row reporting
+- Built-in layouts and reusable custom templates, palettes, and object styles
 - MCP server for programmatic design editing, export, and visual snapshots
 
 ## MCP server
@@ -95,7 +105,23 @@ cargo fmt --all --check
 | Open project | `Cmd/Ctrl+O` |
 | Export PNG | `Cmd/Ctrl+E` |
 | Duplicate layer | `Cmd/Ctrl+D` |
+| Copy / paste objects | `Cmd/Ctrl+C` / `Cmd/Ctrl+V` |
+| Paste style | `Cmd/Ctrl+Shift+V` |
+| Group / ungroup | `Cmd/Ctrl+G` / `Cmd/Ctrl+Shift+G` |
+| Nudge / larger nudge | Arrow keys / `Shift` + arrow keys |
+| Text / shapes / import image | `T` / `S` / `I` |
+| Bring to front / send to back | `Cmd/Ctrl+PageUp` / `Cmd/Ctrl+PageDown` |
 | Delete layer | `Delete` or `Backspace` |
+
+Object shortcuts apply when a text field does not have keyboard focus. The object
+clipboard works inside Button Studio; text fields retain their normal system
+clipboard behavior.
+
+Open **Library** for built-in layouts and reusable templates, palettes, and styles.
+Open **Export & review** to choose PNG, SVG, an A4 PDF sheet, or a personalized
+series PDF. The review shows physical dimensions, print warnings, and sheet
+placement. For series, choose the entry range and copies, inspect personalized
+previews, and fix invalid entries or explicitly skip them with a row-number report.
 
 ## Files
 
@@ -121,10 +147,16 @@ need the original image files for previewing, reopening, or export. Selected
 system fonts remain linked to their original paths; a missing font is reported
 instead of silently changing the design.
 
-Exports are transparent PNG files. For example, a 59 mm button exports at
-697 x 697 pixels, corresponding to 300 DPI. The artwork canvas includes 5 mm
-of wrap/bleed per side; the product preview and export crop that artwork to the
-selected physical button diameter.
+PNG exports include the circular artwork and wrap/bleed at 300 DPI, with transparency
+outside the artwork circle. A 59 mm button has a 69.8 mm artwork diameter including
+5.4 mm of wrap/bleed per side and exports at 824 × 824 pixels. The product preview
+shows the finished 59 mm face. PDF sheets place the full artwork at its physical
+size; print at 100% rather than scaling to fit the page.
+
+SVG import renders artwork to a self-contained PNG at 2048 pixels on the longest
+side. SVG export keeps supported content as vectors; designs using features that
+cannot be represented faithfully use an embedded image with an explicit notice.
+Keep the `.buttonstudio` project for fully editable design state.
 
 Archivo Black is bundled under the SIL Open Font License; see
 [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt).

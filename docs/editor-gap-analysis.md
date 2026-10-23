@@ -2,6 +2,8 @@
 
 **Scope:** assess the current Button Studio editor against the editing behaviors users learn from mature 2D design tools such as Inkscape, then define a practical future baseline for button artwork. This is a product planning document, not a proposal to reproduce Inkscape.
 
+The analysis below records the baseline before implementation. See the implementation status at the end for the capabilities now available. Canvas navigation is excluded from this roadmap.
+
 ## Executive summary
 
 Button Studio already covers the main object types and the production path: users can create and position text, preset shapes, images, QR codes, and backgrounds, organize layers, undo/redo, and export print-ready artwork. The editor is already useful for straightforward single-button designs.
@@ -96,3 +98,21 @@ References:
 - [Inkscape Beginners’ Guide: Styling Text](https://inkscape-manuals.readthedocs.io/en/latest/styling-text.html)
 - [Inkscape Beginners’ Guide: Strokes](https://inkscape-manuals.readthedocs.io/en/latest/strokes.html)
 - [Inkscape Beginners’ Guide: Managing Workspace](https://inkscape-manuals.readthedocs.io/en/latest/managing-workspace.html)
+
+## Implementation status — 2026-10-23
+
+| Step | Delivered |
+| --- | --- |
+| Precise editing | Millimeter position and dimensions, measured text bounds, numeric rotation, proportional sizing, centering, image/shape flips, and compatible version 10 project data |
+| Composition | Shift-click and marquee selection, combined selection handles, bulk move/scale/rotate, alignment, center distribution, grouping/ungrouping, layer names/locks/drag ordering, and snapping with temporary guides |
+| Everyday actions | Object copy/paste with embedded assets across documents, duplicate/delete, style paste, keyboard shortcuts and Help, undo/redo, and confirmation before clearing artwork |
+| Appearance and typography | Independent fill and outline color/width, rounded rectangles, text alignment/line spacing/letter spacing, and the existing Font Browser for installed weights/styles |
+| Images | Editable frame proportions, contain/cover, crop pan/reset, flips, preserved original embedded artwork, and consistent preview/export rendering |
+| Production | Trim/bleed and a safe area inset 2 mm from the finished edge, preflight findings, an export review window, and an expandable A4 placement preview using the PDF exporter’s layout |
+| Series | Entry range and copies, personalized preview, source row numbers in validation, and an explicit option to skip invalid entries with a report |
+| Reuse | Three built-in layouts, saved custom templates, palettes and styles, with validation and backward-compatible project loading |
+| Interchange | SVG image import at 2048 pixels on the longest side with a flattening notice; SVG export preserves supported native content and explicitly falls back to a 2400 pixel embedded image for unsupported effects |
+
+Simple gradients remain a future option. The implemented appearance baseline uses solid fills and independent outlines. Native SVG export does not embed fonts; the review window identifies substitution risk. Projects remain the fully editable source of truth. General path drawing, tracing, Boolean operations, and extensions remain outside this baseline.
+
+Automated coverage includes physical dimensions and units; group transforms and boundary clamps; clipboard assets and IDs; selection and keyboard focus; legacy project defaults and round trips; crop/flip/outline pixels; typography; print layout and preflight; invalid series rows; templates/styles; SVG import/export; and a smoke test of editor tools and dialogs at the minimum window size. End-to-end workflow tests combine import, styling, grouping, undo/redo, save/reopen, and personalized rendering.
