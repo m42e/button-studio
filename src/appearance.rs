@@ -239,3 +239,109 @@ pub enum ImageFit {
     Contain,
     Cover,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Design, DesignColor, ElementKind, ShapeKind};
+
+    fn render_expanded_controls(mut element: crate::model::Element) -> bool {
+        let context = eframe::egui::Context::default();
+        let input = eframe::egui::RawInput {
+            screen_rect: Some(eframe::egui::Rect::from_min_size(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::vec2(480.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let mut changed = false;
+        let _ = context.run_ui(input, |ui| {
+            let id = ui.make_persistent_id("Appearance");
+            let mut state =
+                eframe::egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    id,
+                    false,
+                );
+            state.set_open(true);
+            state.store(ui.ctx());
+            changed = controls(ui, &mut element, 59.0);
+        });
+        changed
+    }
+
+    #[test]
+    fn normalize_clamps_finite_values_and_resets_non_finite_values() {
+        let mut appearance = Appearance {
+            outline_width: 0.5,
+            corner_radius: 0.8,
+            line_spacing: 0.1,
+            letter_spacing: 101.0,
+            image_frame_aspect: Some(200.0),
+            crop_pan: [-2.0, 0.5],
+            ..Default::default()
+        };
+        appearance.normalize();
+        assert_eq!(appearance.outline_width, 0.25);
+        assert_eq!(appearance.corner_radius, 0.5);
+        assert_eq!(appearance.line_spacing, 0.25);
+        assert_eq!(appearance.letter_spacing, 100.0);
+        assert_eq!(appearance.image_frame_aspect, Some(100.0));
+        assert_eq!(appearance.crop_pan, [-1.0, 0.5]);
+
+        appearance.outline_width = f32::NAN;
+        appearance.corner_radius = f32::INFINITY;
+        appearance.line_spacing = f32::NEG_INFINITY;
+        appearance.letter_spacing = f32::NAN;
+        appearance.image_frame_aspect = Some(f32::NAN);
+        appearance.crop_pan = [f32::INFINITY, f32::NAN];
+        appearance.normalize();
+        assert_eq!(appearance.outline_width, 0.0);
+        assert_eq!(appearance.corner_radius, 0.0);
+        assert_eq!(appearance.line_spacing, 1.0);
+        assert_eq!(appearance.letter_spacing, 0.0);
+        assert_eq!(appearance.image_frame_aspect, None);
+        assert_eq!(appearance.crop_pan, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn expanded_controls_render_for_text_rectangle_and_cover_image() {
+        let mut design = Design::default();
+        let text = design.elements[1].clone();
+        assert!(!render_expanded_controls(text));
+
+        let rectangle_id = design.add_shape(ShapeKind::Rectangle);
+        let rectangle = design.element(rectangle_id).unwrap().clone();
+        assert!(!render_expanded_controls(rectangle));
+
+        let image_id = design.insert_element(crate::model::Element {
+            id: 0,
+            name_override: None,
+            locked: false,
+            group_id: None,
+            flip_x: false,
+            flip_y: false,
+            appearance: Appearance {
+                image_fit: ImageFit::Cover,
+                image_frame_aspect: Some(1.5),
+                outline: Some(DesignColor::INK),
+                outline_width: 0.01,
+                ..Default::default()
+            },
+            position: [0.0, 0.0],
+            rotation: 0.0,
+            color: DesignColor::WHITE,
+            opacity: 255,
+            visible: true,
+            kind: ElementKind::Image {
+                asset_id: "asset".into(),
+                width: 0.5,
+                aspect_ratio: 1.0,
+                bleed_to_square: false,
+            },
+        });
+        assert!(!render_expanded_controls(
+            design.element(image_id).unwrap().clone()
+        ));
+    }
+}
